@@ -13,12 +13,22 @@ final class PaintSession: ObservableObject {
     @Published var tool: PaintTool = .pencil
     @Published var primaryColor: Color = .black
     @Published var secondaryColor: Color = .white
-    @Published var brushSize: Double = 4
+    /// Only ever one of `brushSizeOptions`: the arbitrary px selector is gone,
+    /// so the setter snaps every write — UI, keyboard, or direct API — onto the
+    /// nearest shipped size.
+    @Published var brushSize: Double = PaintSession.brushSizeOptions[0] {
+        didSet {
+            let snapped = Self.nearestBrushSizeOption(to: brushSize)
+            if brushSize != snapped { brushSize = snapped }
+        }
+    }
     @Published var zoom: Double = 1
     @Published var cursorPosition: CGPoint?
     @Published var isPresentingResize = false
     @Published private(set) var fileURL: URL?
 
+    /// The three sizes the editor offers, ascending: Thin, Medium, Thick.
+    static let brushSizeOptions: [Double] = [4, 16, 64]
     static let brushSizeRange: ClosedRange<Double> = 1...128
     static let zoomRange: ClosedRange<Double> = 0.25...2
     static let dimensionRange: ClosedRange<Int> = 1...4096
@@ -41,10 +51,33 @@ final class PaintSession: ObservableObject {
 
     func select(_ tool: PaintTool) {
         self.tool = tool
+        // Thick Brush is pointless at a hairline width, so selecting it lifts
+        // the size to the first option that clears the tool's floor.
+        let minimum = Double(tool.minimumStrokeWidth)
+        if brushSize < minimum {
+            brushSize = Self.brushSizeOptions.first { $0 >= minimum }
+                ?? Self.brushSizeOptions.last
+                ?? minimum
+        }
     }
 
+    /// Exact size selection (the ribbon's Thin / Medium / Thick buttons).
+    func setBrushSize(_ value: Double) {
+        brushSize = Self.nearestBrushSizeOption(to: value)
+    }
+
+    /// Increase / decrease requests step through the fixed options instead of
+    /// walking an arbitrary px value, and stop at the ends of the list.
     func nudgeBrushSize(by delta: Double) {
-        brushSize = min(max(brushSize + delta, Self.brushSizeRange.lowerBound), Self.brushSizeRange.upperBound)
+        guard delta != 0 else { return }
+        let options = Self.brushSizeOptions
+        let current = options.firstIndex(of: Self.nearestBrushSizeOption(to: brushSize)) ?? 0
+        let next = delta > 0 ? min(current + 1, options.count - 1) : max(current - 1, 0)
+        brushSize = options[next]
+    }
+
+    static func nearestBrushSizeOption(to value: Double) -> Double {
+        brushSizeOptions.min { abs($0 - value) < abs($1 - value) } ?? value
     }
 
     func zoomIn() { setZoom(zoom + 0.25) }

@@ -194,6 +194,10 @@ final class PaintDocument: ObservableObject {
             paint = color
             width = max(1, lineWidth)
             cap = .round
+        case .thickBrush:
+            paint = color
+            width = max(lineWidth, tool.minimumStrokeWidth)
+            cap = .round
         case .eraser:
             paint = secondaryColor
             width = max(1, lineWidth)

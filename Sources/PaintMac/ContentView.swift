@@ -107,7 +107,7 @@ private struct RibbonBar: View {
                 RibbonGroup(title: "Tools") {
                     HStack(spacing: 4) {
                         ForEach(PaintTool.drawingTools) { tool in
-                            ToolButton(tool: tool, selection: $session.tool)
+                            ToolButton(tool: tool, session: session)
                         }
                     }
                 }
@@ -115,7 +115,7 @@ private struct RibbonBar: View {
                 RibbonGroup(title: "Shapes") {
                     LazyHGrid(rows: Self.shapeRows, spacing: Self.shapeSpacing) {
                         ForEach(PaintTool.shapeTools) { tool in
-                            ToolButton(tool: tool, selection: $session.tool)
+                            ToolButton(tool: tool, session: session)
                         }
                     }
                     .frame(width: Self.shapeGridSize.width, height: Self.shapeGridSize.height)
@@ -190,18 +190,24 @@ private struct ToolButton: View {
     private static let drawingSide: CGFloat = 34
 
     let tool: PaintTool
-    @Binding var selection: PaintTool
+    /// Selection goes through the session rather than a plain binding so every
+    /// button applies the tool's stroke-width floor (Thick Brush) exactly the
+    /// way the Tools menu does.
+    @ObservedObject var session: PaintSession
 
-    private var isSelected: Bool { selection == tool }
+    private var isSelected: Bool { session.tool == tool }
     private var side: CGFloat { tool.isShape ? Self.shapeSide : Self.drawingSide }
     private var tint: Color { isSelected ? Color.accentColor : Color.primary }
 
     var body: some View {
         Button {
-            selection = tool
+            session.select(tool)
         } label: {
             glyph
                 .frame(width: side, height: side)
+                .overlay(alignment: .bottomTrailing) {
+                    if tool == .thickBrush { thickBadge }
+                }
                 .background(
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
@@ -230,6 +236,20 @@ private struct ToolButton: View {
                 .font(.system(size: 15))
                 .foregroundStyle(tint)
         }
+    }
+
+    /// Thick Brush wears the paintbrush symbol like Brush does, so the badge is
+    /// what makes the two unmistakable side by side in the ribbon.
+    private var thickBadge: some View {
+        Text("XL")
+            .font(.system(size: 8, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 2.5)
+            .padding(.vertical, 0.5)
+            .background(Capsule(style: .continuous).fill(Color.accentColor))
+            .overlay(Capsule(style: .continuous).strokeBorder(.white.opacity(0.85), lineWidth: 0.5))
+            .padding(1)
+            .accessibilityHidden(true)
     }
 
     private var helpText: String {
@@ -292,76 +312,67 @@ private struct RibbonActionButton: View {
     }
 }
 
+/// Three fixed sizes replace the old slider / stepper / px picker: the editor
+/// no longer exposes an arbitrary pixel width, so the ribbon offers exactly the
+/// widths `PaintSession.brushSizeOptions` allows.
 private struct SizeControl: View {
     @ObservedObject var session: PaintSession
 
-    private static let standardPresets: [Int] = [4, 8, 16, 32]
-    private static let extraThickPresets: [Int] = [64, 96, 128]
+    private struct Choice: Identifiable {
+        let value: Double
+        let title: String
+        /// Stroke height of the preview glyph — not the real width, just enough
+        /// to read the three steps apart at ribbon scale.
+        let weight: CGFloat
+
+        var id: Double { value }
+    }
+
+    /// Values mirror `PaintSession.brushSizeOptions`, ascending.
+    private static let choices: [Choice] = zip(
+        PaintSession.brushSizeOptions,
+        [("Thin", CGFloat(2)), ("Medium", CGFloat(5)), ("Thick", CGFloat(11))]
+    ).map { Choice(value: $0, title: $1.0, weight: $1.1) }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(Color.primary)
-                .frame(
-                    width: min(max(session.brushSize, 2), 26),
-                    height: min(max(session.brushSize, 2), 26)
-                )
-                .frame(width: 30, height: 30)
-            VStack(alignment: .leading, spacing: 2) {
-                Slider(
-                    value: $session.brushSize,
-                    in: PaintSession.brushSizeRange,
-                    step: 1
-                )
-                .controlSize(.small)
-                .frame(width: 132)
-                HStack(spacing: 6) {
-                    Text("\(Int(session.brushSize)) px")
-                        .font(.system(size: 11).monospacedDigit())
-                    Stepper("Brush size") {
-                        session.nudgeBrushSize(by: 1)
-                    } onDecrement: {
-                        session.nudgeBrushSize(by: -1)
-                    }
-                    .labelsHidden()
-                    .controlSize(.mini)
-                    presetMenu
-                }
+        HStack(spacing: 4) {
+            ForEach(Self.choices) { choice in
+                button(for: choice)
             }
         }
-        .help("Brush size — [ and ] adjust it")
+        .help("Brush size — [ and ] step through Thin, Medium and Thick")
     }
 
-    private var presetMenu: some View {
-        Menu {
-            Section("Standard") {
-                ForEach(Self.standardPresets, id: \.self) { presetToggle(for: $0) }
-            }
-            Section("Extra thick") {
-                ForEach(Self.extraThickPresets, id: \.self) { presetToggle(for: $0) }
-            }
+    private func button(for choice: Choice) -> some View {
+        let isSelected = session.brushSize == choice.value
+        let tint = isSelected ? Color.accentColor : Color.primary
+        return Button {
+            session.setBrushSize(choice.value)
         } label: {
-            Image(systemName: "lineweight")
-                .font(.system(size: 11))
-        }
-        .menuStyle(.borderlessButton)
-        .controlSize(.mini)
-        .fixedSize()
-        .help("Brush size presets")
-        .accessibilityLabel("Brush size presets")
-    }
-
-    private func presetToggle(for value: Int) -> some View {
-        Toggle(isOn: Binding(
-            get: { Int(session.brushSize.rounded()) == value },
-            set: { isOn in
-                if isOn {
-                    session.brushSize = Double(value)
-                }
+            VStack(spacing: 5) {
+                Capsule(style: .continuous)
+                    .fill(tint)
+                    .frame(width: 26, height: choice.weight)
+                    .frame(height: 12)
+                Text(choice.title)
+                    .font(.system(size: 9, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
             }
-        )) {
-            Text("\(value) px")
+            .frame(width: 46, height: 38)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(isSelected ? Color.accentColor.opacity(0.55) : Color.secondary.opacity(0.22))
+            )
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .help("\(choice.title) brush — \(Int(choice.value)) px")
+        .accessibilityLabel("\(choice.title) brush size")
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 }
 
@@ -454,7 +465,13 @@ private struct CanvasWorkspace: View {
             tool: $session.tool,
             primaryColor: $session.primaryColor,
             secondaryColor: $session.secondaryColor,
-            brushSize: $session.brushSize,
+            // The `[` / `]` canvas shortcuts arrive as a delta write, so they
+            // are routed through the session to step between the three fixed
+            // sizes instead of landing on an arbitrary px value.
+            brushSize: Binding(
+                get: { session.brushSize },
+                set: { session.nudgeBrushSize(by: $0 - session.brushSize) }
+            ),
             zoom: $session.zoom,
             cursorPosition: $session.cursorPosition
         )

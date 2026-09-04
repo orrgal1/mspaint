@@ -56,9 +56,16 @@ private let expectedShapeCatalogue: [PaintTool] = [
     .heart, .lightning,
 ]
 
+/// The freehand and sampling tools, in palette order. Thick Brush sits between
+/// Brush and Eraser: spelled out literally so a dropped or misplaced entry
+/// fails here rather than agreeing with whatever the enum happens to say.
 private let expectedDrawingTools: [PaintTool] = [
-    .pencil, .brush, .eraser, .fill, .eyedropper, .text,
+    .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
 ]
+
+/// The floor every tool imposes on a requested stroke width. Thick Brush is
+/// thick by construction; everything else may go down to a single pixel.
+private let expectedMinimumStrokeWidths: [PaintTool: CGFloat] = [.thickBrush: 64]
 
 /// The bare-key shortcuts that shipped before the catalogue grew. Every other
 /// tool must report `nil` rather than claim a key of its own.
@@ -195,6 +202,7 @@ final class ModelSmokeRun {
     func run() throws {
         try scenario("initial document") { try initialDocument() }
         try scenario("brush stroke checkpoint") { try brushStrokeCheckpoint() }
+        try scenario("thick brush stroke") { try thickBrushStroke() }
         try scenario("cancelled stroke") { try cancelledStroke() }
         try scenario("no-op fill") { try noOpFill() }
         try scenario("bounded flood fill") { try boundedFloodFill() }
@@ -381,6 +389,34 @@ final class ModelSmokeRun {
         )
     }
 
+    /// True when the pixel holds fully opaque dark ink, by the same standard
+    /// `expectInk` applies.
+    private func isInk(_ document: PaintDocument, _ x: Int, _ y: Int) throws -> Bool {
+        let sample = try pixel(document, x, y)
+        return sample.r <= inkChannelCeiling
+            && sample.g <= inkChannelCeiling
+            && sample.b <= inkChannelCeiling
+            && sample.a >= 0.99
+    }
+
+    /// Longest run of consecutive fully inked pixels down column `x`. Measures
+    /// the painted cross-section of a horizontal stroke, so a tool that renders
+    /// thinner than promised reports a smaller number instead of merely missing
+    /// one sampled pixel.
+    private func verticalInkRun(_ document: PaintDocument, column x: Int) throws -> Int {
+        var longest = 0
+        var current = 0
+        for y in 0..<document.pixelHeight {
+            if try isInk(document, x, y) {
+                current += 1
+                longest = max(longest, current)
+            } else {
+                current = 0
+            }
+        }
+        return longest
+    }
+
     private func fixed(_ value: Double) -> String {
         String(format: "%.3f", value)
     }
@@ -453,6 +489,90 @@ final class ModelSmokeRun {
 
         document.redo()
         try expectInk(document, 20, 32, "redone brush ink")
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+    }
+
+    /// Thick Brush must be unmistakably thick and behave like Brush otherwise.
+    ///
+    /// The stroke is requested at 4pt — the width an ordinary brush would honour
+    /// literally — so this fails if the model ever stops enforcing the tool's
+    /// own minimum for callers that reach `drawStroke` directly.
+    private func thickBrushStroke() throws {
+        let document = PaintDocument(width: 160, height: 160)
+        let revisionBefore = document.revision
+        let minimum = Int(PaintTool.thickBrush.minimumStrokeWidth)
+
+        // One transaction, three drag segments along a horizontal line: history
+        // must gain exactly one entry, and the painted band must be as tall as
+        // the tool's minimum regardless of the requested width.
+        document.beginStroke()
+        for step in 0..<3 {
+            let x = 48.0 + Double(step) * 8.0
+            document.drawStroke(
+                from: CGPoint(x: x, y: 80),
+                to: CGPoint(x: x + 8, y: 80),
+                tool: .thickBrush,
+                color: .black,
+                secondaryColor: .white,
+                lineWidth: 4
+            )
+        }
+        document.endStroke()
+
+        try expect(document.revision > revisionBefore, "thick brush must bump revision")
+        try expectInk(document, 60, 80, "thick brush core")
+        try expectInk(document, 60, 80 - minimum / 2 + 1, "thick brush band, one edge")
+        try expectInk(document, 60, 80 + minimum / 2 - 1, "thick brush band, other edge")
+
+        let thickRun = try verticalInkRun(document, column: 60)
+        try expect(
+            thickRun >= minimum,
+            "thick brush cross-section is \(thickRun)px of solid ink, expected at least \(minimum)px"
+        )
+        try expectPixel(document, 60, 4, .white, "canvas above the thick band")
+        try expectPixel(document, 4, 80, .white, "canvas beside the thick band")
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+
+        // The same 4pt request through the ordinary brush stays thin, so the
+        // width above comes from the tool and not from a global floor.
+        let thin = PaintDocument(width: 160, height: 160)
+        thin.beginStroke()
+        for step in 0..<3 {
+            let x = 48.0 + Double(step) * 8.0
+            thin.drawStroke(
+                from: CGPoint(x: x, y: 80),
+                to: CGPoint(x: x + 8, y: 80),
+                tool: .brush,
+                color: .black,
+                secondaryColor: .white,
+                lineWidth: 4
+            )
+        }
+        thin.endStroke()
+        let thinRun = try verticalInkRun(thin, column: 60)
+        try expect(
+            thinRun >= 1 && thinRun <= 8,
+            "ordinary 4pt brush cross-section is \(thinRun)px of solid ink, expected 1...8px"
+        )
+
+        // One checkpoint for the whole drag: a single undo reaches the pristine
+        // bitmap, and redo brings the full-width band back.
+        document.undo()
+        try expectPixel(document, 60, 80, .white, "undone thick brush core")
+        try expectEqual(
+            try verticalInkRun(document, column: 60),
+            0,
+            "solid ink pixels remaining after undo"
+        )
+        try expectFlags(document, undo: false, redo: true, dirty: false)
+
+        document.redo()
+        try expectInk(document, 60, 80, "redone thick brush core")
+        let redoneRun = try verticalInkRun(document, column: 60)
+        try expect(
+            redoneRun >= minimum,
+            "redone thick brush cross-section is \(redoneRun)px, expected at least \(minimum)px"
+        )
         try expectFlags(document, undo: true, redo: false, dirty: true)
     }
 
@@ -584,11 +704,41 @@ final class ModelSmokeRun {
             PaintTool.shapeTools == expectedShapeCatalogue,
             "shapeTools is \(names(PaintTool.shapeTools)), expected \(names(expectedShapeCatalogue))"
         )
+        try expectEqual(PaintTool.drawingTools.count, 7, "drawing tool count")
         try expect(
             PaintTool.drawingTools == expectedDrawingTools,
             "drawingTools is \(names(PaintTool.drawingTools)), "
                 + "expected \(names(expectedDrawingTools))"
         )
+        // Position, not just membership: Thick Brush must sit between Brush and
+        // Eraser in the ribbon rather than being appended out of the way.
+        try expectEqual(
+            PaintTool.drawingTools.firstIndex(of: .thickBrush) ?? -1,
+            2,
+            "thickBrush position in drawingTools"
+        )
+        try expect(
+            !PaintTool.thickBrush.isShape,
+            "thickBrush must be a freehand tool, not a shape"
+        )
+        try expect(
+            PaintTool.thickBrush.title == "Thick Brush",
+            "thickBrush title is \"\(PaintTool.thickBrush.title)\", expected \"Thick Brush\""
+        )
+        try expect(
+            PaintTool.thickBrush.shortcut == nil,
+            "thickBrush must carry no bare-key shortcut, got "
+                + describe(PaintTool.thickBrush.shortcut)
+        )
+
+        for tool in PaintTool.allCases {
+            let expected = expectedMinimumStrokeWidths[tool] ?? 1
+            try expect(
+                tool.minimumStrokeWidth == expected,
+                "\(tool.rawValue) minimumStrokeWidth is \(tool.minimumStrokeWidth), "
+                    + "expected \(expected)"
+            )
+        }
 
         for tool in PaintTool.shapeTools {
             try expect(tool.isShape, "\(tool.rawValue) is in shapeTools but isShape is false")

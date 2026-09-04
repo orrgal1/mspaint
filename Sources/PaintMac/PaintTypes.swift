@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// The drawing tools offered by the toolbox, in palette order.
@@ -10,6 +11,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     // Drawing tools.
     case pencil
     case brush
+    case thickBrush
     case eraser
     case fill
     case eyedropper
@@ -43,7 +45,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
 
     /// The freehand and sampling tools, in palette order.
     static let drawingTools: [PaintTool] = [
-        .pencil, .brush, .eraser, .fill, .eyedropper, .text,
+        .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
     ]
 
     /// The shape catalog, in the order the shape picker renders it.
@@ -59,7 +61,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// True for every tool drawn by dragging out a shape from `PaintShapeGeometry`.
     var isShape: Bool {
         switch self {
-        case .pencil, .brush, .eraser, .fill, .eyedropper, .text:
+        case .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text:
             return false
         case .line, .curve, .rectangle, .roundedRectangle, .ellipse,
             .triangle, .rightTriangle, .diamond, .pentagon, .hexagon,
@@ -76,6 +78,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
         switch self {
         case .pencil: return "Pencil"
         case .brush: return "Brush"
+        case .thickBrush: return "Thick Brush"
         case .eraser: return "Eraser"
         case .fill: return "Fill With Color"
         case .eyedropper: return "Pick Color"
@@ -111,6 +114,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
         switch self {
         case .pencil: return "pencil"
         case .brush: return "paintbrush.pointed.fill"
+        case .thickBrush: return "paintbrush.fill"
         case .eraser: return "eraser.fill"
         case .fill: return "drop.fill"
         case .eyedropper: return "eyedropper"
@@ -142,11 +146,13 @@ enum PaintTool: String, CaseIterable, Identifiable {
 
     /// Single character keyboard shortcut, unique across all tools. The shapes
     /// added beyond the original three are reachable from the shape picker only,
-    /// so they deliberately carry no bare-key shortcut.
+    /// so they deliberately carry no bare-key shortcut, and Thick Brush leaves
+    /// the letter keys to the tools that already own them.
     var shortcut: Character? {
         switch self {
         case .pencil: return "p"
         case .brush: return "b"
+        case .thickBrush: return nil
         case .eraser: return "e"
         case .fill: return "f"
         case .eyedropper: return "k"
@@ -160,6 +166,23 @@ enum PaintTool: String, CaseIterable, Identifiable {
             .rectangularCallout, .roundedCallout, .ovalCallout,
             .heart, .lightning:
             return nil
+        }
+    }
+
+    /// Smallest stroke width the tool is allowed to draw with. Thick Brush is a
+    /// deliberately broad marker, so it clamps well above the manual minimum;
+    /// every other tool can go all the way down to a single pixel.
+    var minimumStrokeWidth: CGFloat {
+        switch self {
+        case .thickBrush: return 64
+        case .pencil, .brush, .eraser, .fill, .eyedropper, .text,
+            .line, .curve, .rectangle, .roundedRectangle, .ellipse,
+            .triangle, .rightTriangle, .diamond, .pentagon, .hexagon,
+            .rightArrow, .leftArrow, .upArrow, .downArrow,
+            .fourPointStar, .fivePointStar, .sixPointStar,
+            .rectangularCallout, .roundedCallout, .ovalCallout,
+            .heart, .lightning:
+            return 1
         }
     }
 }

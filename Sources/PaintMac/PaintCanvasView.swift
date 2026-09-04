@@ -249,7 +249,7 @@ final class PaintCanvasView: NSView {
         let alternate = secondary ? primaryColor : secondaryColor
 
         switch tool {
-        case .pencil, .brush, .eraser:
+        case .pencil, .brush, .thickBrush, .eraser:
             gesture = .freehand
             lastPoint = point
             document.beginStroke()
@@ -567,8 +567,11 @@ struct PaintCanvasRepresentable: NSViewRepresentable {
 
         let brushBinding = $brushSize
         view.onBrushSizeDelta = { delta in
-            let range = PaintSession.brushSizeRange
-            let next = min(max(brushBinding.wrappedValue + delta, range.lowerBound), range.upperBound)
+            let options = PaintSession.brushSizeOptions
+            guard !options.isEmpty else { return }
+            let currentIndex = options.firstIndex(where: { $0 >= brushBinding.wrappedValue }) ?? options.count - 1
+            let nextIndex = min(max(currentIndex + (delta > 0 ? 1 : -1), 0), options.count - 1)
+            let next = options[nextIndex]
             if brushBinding.wrappedValue != next {
                 brushBinding.wrappedValue = next
             }
