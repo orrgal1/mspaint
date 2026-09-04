@@ -416,6 +416,103 @@ final class PaintDocument: ObservableObject {
         markMutated()
     }
 
+    // MARK: Selection
+
+    /// Opaque copy of the pixels covered by `rect`, or nil when the request
+    /// does not cover at least one whole pixel of the canvas. Read only: no
+    /// pixels change, no revision bump, no history entry.
+    func selectionImage(in rect: CGRect) -> CGImage? {
+        guard let area = pixelRect(rect), let image = cgImage else { return nil }
+        // `cropping` works in the image's top-left pixel space, our rectangles
+        // are bottom-left document space.
+        return image.cropping(
+            to: CGRect(
+                x: area.minX,
+                y: CGFloat(buffer.height) - area.maxY,
+                width: area.width,
+                height: area.height
+            )
+        )
+    }
+
+    /// Moves, scales and rotates a previously captured selection as one
+    /// undoable operation: the source area is repainted with `background`,
+    /// then `image` is drawn into `destinationRect`, rotated counterclockwise
+    /// by `rotation` radians around that rectangle's centre and clipped by the
+    /// canvas. Requests that cannot change anything — degenerate rectangles,
+    /// or an unrotated selection put back exactly where it came from — leave
+    /// the document and its history untouched.
+    func transformSelection(
+        _ image: CGImage,
+        from sourceRect: CGRect,
+        to destinationRect: CGRect,
+        rotation: CGFloat,
+        background: NSColor
+    ) {
+        guard rotation.isFinite,
+              let source = PaintDocument.normalizedRect(sourceRect),
+              let destination = PaintDocument.normalizedRect(destinationRect),
+              destination.width > 0,
+              destination.height > 0
+        else { return }
+
+        let isUnrotated = abs(rotation) <= PaintDocument.rotationEpsilon
+        if isUnrotated, PaintDocument.sameRect(source, destination) { return }
+
+        let canvas = CGRect(x: 0, y: 0, width: buffer.width, height: buffer.height)
+        let clearArea = pixelRect(source)
+        // Nothing to vacate and nothing that lands on the canvas: no-op.
+        guard clearArea != nil || destination.intersects(canvas) else { return }
+
+        let snapshot = makeSnapshot()
+        let context = buffer.context
+
+        if let clearArea {
+            context.saveGState()
+            context.setBlendMode(.copy)
+            context.setFillColor(PaintDocument.cgColor(background))
+            context.fill(clearArea)
+            context.restoreGState()
+        }
+
+        context.saveGState()
+        context.clip(to: canvas)
+        context.setShouldAntialias(true)
+        context.interpolationQuality = .high
+        if !isUnrotated {
+            // Positive angles turn counterclockwise in this bottom-left space.
+            context.translateBy(x: destination.midX, y: destination.midY)
+            context.rotate(by: rotation)
+            context.translateBy(x: -destination.midX, y: -destination.midY)
+        }
+        // `draw` puts image row 0 along the top edge, which is exactly how the
+        // crop in `selectionImage` was taken, so orientation survives.
+        context.draw(image, in: destination)
+        context.restoreGState()
+
+        pushUndo(snapshot)
+        didMutate()
+        markMutated()
+    }
+
+    /// Repaints the selected area with `background` as one undoable operation.
+    /// A selection that covers no whole pixel leaves no history entry.
+    func deleteSelection(in rect: CGRect, background: NSColor) {
+        guard let area = pixelRect(rect) else { return }
+
+        let snapshot = makeSnapshot()
+        let context = buffer.context
+        context.saveGState()
+        context.setBlendMode(.copy)
+        context.setFillColor(PaintDocument.cgColor(background))
+        context.fill(area)
+        context.restoreGState()
+
+        pushUndo(snapshot)
+        didMutate()
+        markMutated()
+    }
+
     // MARK: Whole-canvas operations
 
     func clear(color: NSColor) {
@@ -748,6 +845,38 @@ final class PaintDocument: ObservableObject {
         let y = Int(point.y.rounded(.down))
         guard buffer.contains(x: x, y: y) else { return nil }
         return (x, y)
+    }
+
+    /// Whole-pixel document rectangle covered by `rect`: normalised, grown to
+    /// the enclosing pixel boundaries and clipped to the bitmap. Nil when the
+    /// result would not contain a single pixel.
+    private func pixelRect(_ rect: CGRect) -> CGRect? {
+        guard let normalized = PaintDocument.normalizedRect(rect) else { return nil }
+        let canvas = CGRect(x: 0, y: 0, width: buffer.width, height: buffer.height)
+        let area = normalized.integral.intersection(canvas)
+        guard !area.isNull, area.width >= 1, area.height >= 1 else { return nil }
+        return area
+    }
+
+    /// Rejects non-finite geometry and flips negative extents, so a rectangle
+    /// dragged up or to the left describes the same area as one dragged down.
+    private static func normalizedRect(_ rect: CGRect) -> CGRect? {
+        guard rect.origin.x.isFinite, rect.origin.y.isFinite,
+              rect.size.width.isFinite, rect.size.height.isFinite
+        else { return nil }
+        return rect.standardized
+    }
+
+    /// Rotations this small cannot move a pixel on any canvas we allow.
+    private static let rotationEpsilon: CGFloat = 1e-6
+
+    @inline(__always)
+    private static func sameRect(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        let epsilon: CGFloat = 1e-6
+        return abs(lhs.minX - rhs.minX) <= epsilon
+            && abs(lhs.minY - rhs.minY) <= epsilon
+            && abs(lhs.width - rhs.width) <= epsilon
+            && abs(lhs.height - rhs.height) <= epsilon
     }
 
     /// Keeps drawing coordinates inside the bitmap so a drag that leaves the

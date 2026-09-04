@@ -56,7 +56,12 @@ private func paintedWidthSlack(_ expected: Int) -> Int {
     max(1, expected / 8)
 }
 
-// MARK: - Shape catalogue expectations
+// MARK: - Tool catalogue expectations
+
+/// Every tool this build must expose, counted literally: eight non-shape tools
+/// plus the twenty-two shapes. A tool added or dropped without updating the
+/// tables below fails here first.
+private let expectedToolCount = 30
 
 /// The shape catalogue this build must expose, in palette order. Spelled out
 /// literally rather than derived from `PaintTool`, so dropping, renaming or
@@ -70,11 +75,12 @@ private let expectedShapeCatalogue: [PaintTool] = [
     .heart, .lightning,
 ]
 
-/// The freehand and sampling tools, in palette order. Thick Brush sits between
+/// The non-shape tools, in palette order. Select leads the ribbon, exactly as
+/// Paint puts its selector before the pencil, and Thick Brush sits between
 /// Brush and Eraser: spelled out literally so a dropped or misplaced entry
 /// fails here rather than agreeing with whatever the enum happens to say.
 private let expectedDrawingTools: [PaintTool] = [
-    .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
+    .select, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
 ]
 
 /// The one width every tool draws with, spelled out literally instead of read
@@ -82,9 +88,9 @@ private let expectedDrawingTools: [PaintTool] = [
 /// rather than agreeing with itself. Width is embodied by the tool: Pencil is a
 /// single pixel, Brush is the medium stroke, Thick Brush is the broad marker,
 /// Eraser matches Brush exactly, and Text and every shape share one fine
-/// outline. Fill and Eyedropper never stroke, so their value is unused.
+/// outline. Select, Fill and Eyedropper never stroke, so their value is unused.
 private let expectedStrokeWidths: [PaintTool: CGFloat] = [
-    .pencil: 1, .fill: 1, .eyedropper: 1,
+    .select: 1, .pencil: 1, .fill: 1, .eyedropper: 1,
     .brush: 16, .eraser: 16,
     .thickBrush: 64,
     .text: 4,
@@ -96,9 +102,10 @@ private let expectedStrokeWidths: [PaintTool: CGFloat] = [
     .heart: 4, .lightning: 4,
 ]
 
-/// The bare-key shortcuts that shipped before the catalogue grew. Every other
-/// tool must report `nil` rather than claim a key of its own.
+/// The bare-key shortcuts this build must expose. Every other tool must report
+/// `nil` rather than claim a key of its own; Select owns "s".
 private let expectedShortcuts: [PaintTool: Character] = [
+    .select: "s",
     .pencil: "p", .brush: "b", .eraser: "e", .fill: "f", .eyedropper: "k",
     .text: "t", .line: "l", .rectangle: "r", .ellipse: "o",
 ]
@@ -237,11 +244,18 @@ final class ModelSmokeRun {
         try scenario("no-op fill") { try noOpFill() }
         try scenario("bounded flood fill") { try boundedFloodFill() }
         try scenario("colour pick") { try colourPick() }
-        try scenario("shape catalogue") { try shapeCatalogue() }
+        try scenario("tool catalogue") { try shapeCatalogue() }
         try scenario("shape geometry") { try shapeGeometry() }
         try scenario("shape shift constraints") { try shapeConstraints() }
         try scenario("shape silhouettes") { try shapeSilhouettes() }
         try scenario("shape rendering and history") { try shapeRendering() }
+        try scenario("selection extraction") { try selectionExtraction() }
+        try scenario("selection move") { try selectionMove() }
+        try scenario("selection resize") { try selectionResize() }
+        try scenario("selection rotation") { try selectionRotation() }
+        try scenario("selection delete") { try selectionDelete() }
+        try scenario("selection clipping") { try selectionClipping() }
+        try scenario("selection no-ops") { try selectionNoOps() }
         try scenario("resize and undo across dimensions") { try resizeAcrossDimensions() }
         try scenario("png save and reopen") { try pngSaveAndReopen() }
         try scenario("oriented image import") { try orientedImageImport() }
@@ -851,28 +865,58 @@ final class ModelSmokeRun {
         )
     }
 
-    // MARK: Shape scenarios
+    // MARK: Catalogue scenarios
 
-    /// The catalogue itself: exactly the promised shapes, in order, classified
+    /// The catalogue itself: exactly the promised tools, in order, classified
     /// correctly, and without disturbing the shortcuts that already shipped.
     private func shapeCatalogue() throws {
+        try expectEqual(PaintTool.allCases.count, expectedToolCount, "tool catalogue size")
         try expectEqual(PaintTool.shapeTools.count, 22, "shape catalogue size")
         try expect(
             PaintTool.shapeTools == expectedShapeCatalogue,
             "shapeTools is \(names(PaintTool.shapeTools)), expected \(names(expectedShapeCatalogue))"
         )
-        try expectEqual(PaintTool.drawingTools.count, 7, "drawing tool count")
+        try expectEqual(
+            PaintTool.drawingTools.count,
+            expectedDrawingTools.count,
+            "drawing tool count"
+        )
         try expect(
             PaintTool.drawingTools == expectedDrawingTools,
             "drawingTools is \(names(PaintTool.drawingTools)), "
                 + "expected \(names(expectedDrawingTools))"
         )
-        // Position, not just membership: Thick Brush must sit between Brush and
-        // Eraser in the ribbon rather than being appended out of the way.
+        // Position, not just membership: the selector opens the ribbon and
+        // Thick Brush sits between Brush and Eraser, rather than either being
+        // appended out of the way.
+        try expectEqual(
+            PaintTool.drawingTools.firstIndex(of: .select) ?? -1,
+            expectedDrawingTools.firstIndex(of: .select) ?? -2,
+            "select position in drawingTools"
+        )
+        try expectEqual(
+            PaintTool.drawingTools.firstIndex(of: .select) ?? -1,
+            0,
+            "select must be the first tool in the ribbon"
+        )
+        try expect(
+            (PaintTool.drawingTools.firstIndex(of: .select) ?? .max)
+                < (PaintTool.drawingTools.firstIndex(of: .pencil) ?? -1),
+            "select must come before pencil in drawingTools, got "
+                + names(PaintTool.drawingTools)
+        )
         try expectEqual(
             PaintTool.drawingTools.firstIndex(of: .thickBrush) ?? -1,
-            2,
+            expectedDrawingTools.firstIndex(of: .thickBrush) ?? -2,
             "thickBrush position in drawingTools"
+        )
+        try expect(
+            (PaintTool.drawingTools.firstIndex(of: .brush) ?? .max)
+                < (PaintTool.drawingTools.firstIndex(of: .thickBrush) ?? -1)
+                && (PaintTool.drawingTools.firstIndex(of: .thickBrush) ?? .max)
+                    < (PaintTool.drawingTools.firstIndex(of: .eraser) ?? -1),
+            "thickBrush must sit between Brush and Eraser, got "
+                + names(PaintTool.drawingTools)
         )
         try expect(
             !PaintTool.thickBrush.isShape,
@@ -886,6 +930,29 @@ final class ModelSmokeRun {
             PaintTool.thickBrush.shortcut == nil,
             "thickBrush must carry no bare-key shortcut, got "
                 + describe(PaintTool.thickBrush.shortcut)
+        )
+
+        // The selector: a non-shape tool with its own name, symbol and key.
+        try expect(
+            !PaintTool.select.isShape,
+            "select drags out a marquee, not a shape: isShape must be false"
+        )
+        try expect(
+            PaintTool.select.title == "Select",
+            "select title is \"\(PaintTool.select.title)\", expected \"Select\""
+        )
+        try expect(
+            PaintTool.select.symbolName == "cursorarrow.rays",
+            "select symbol is \"\(PaintTool.select.symbolName)\", expected \"cursorarrow.rays\""
+        )
+        try expect(
+            PaintTool.select.shortcut == "s",
+            "select shortcut is \(describe(PaintTool.select.shortcut)), expected \"s\""
+        )
+        try expect(
+            PaintTool.select.strokeWidth == 1,
+            "select strokeWidth is \(PaintTool.select.strokeWidth); the selector never strokes, "
+                + "so it declares the neutral single pixel"
         )
 
         // Width is embodied by the tool: every case must declare exactly the
@@ -1506,6 +1573,1190 @@ final class ModelSmokeRun {
                 "\(tool.rawValue): ink from a zero-area drag"
             )
         }
+    }
+
+    // MARK: Selection scenarios
+
+    /// The four quadrant colours of the marker every selection scenario moves
+    /// around, plus the unrelated mark outside it and the secondary colour the
+    /// model must vacate source areas with. Deliberately asymmetric: a flip, a
+    /// transpose or a rotation the wrong way round changes at least two of the
+    /// four samples, so no such mistake can look like success.
+    private static let markerBottomLeft = NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1)
+    private static let markerBottomRight = NSColor(srgbRed: 0, green: 0.8, blue: 0, alpha: 1)
+    private static let markerTopRight = NSColor(srgbRed: 1, green: 0, blue: 1, alpha: 1)
+    private static let markerTopLeft = NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)
+    private static let outsideMark = NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)
+    private static let selectionBackground = NSColor(srgbRed: 1, green: 0.85, blue: 0, alpha: 1)
+
+    /// Canvas and marker geometry shared by the selection scenarios. The
+    /// oblong marker is 8×12 so a transform that swaps the axes cannot pass;
+    /// the square one exists for the rotation cases, where a quarter turn must
+    /// land back on its own footprint.
+    private let selectionCanvas = (width: 48, height: 36)
+    private let markerRect = CGRect(x: 4, y: 6, width: 8, height: 12)
+    private let squareMarkerRect = CGRect(x: 6, y: 6, width: 12, height: 12)
+    private let outsideRect = CGRect(x: 40, y: 2, width: 4, height: 4)
+
+    /// Extraction is a pure read of exactly the requested pixels, in the
+    /// orientation the image format stores them, and never touches the
+    /// document.
+    private func selectionExtraction() throws {
+        let document = try markerDocument(rect: markerRect)
+        let revision = document.revision
+
+        let image = try requireSelection(document, markerRect, "marker selection")
+        try expectEqual(image.width, Int(markerRect.width), "selection image width")
+        try expectEqual(image.height, Int(markerRect.height), "selection image height")
+
+        // Row 0 of a `CGImage` is its *top* row, while the document counts
+        // upward from the bottom: the extracted corners must line up with the
+        // document's, so a crop taken upside down fails here.
+        let pixels = try raster(image)
+        try expectImagePixel(pixels, 0, 0, ModelSmokeRun.markerTopLeft, "extracted top-left")
+        try expectImagePixel(
+            pixels,
+            image.width - 1,
+            0,
+            ModelSmokeRun.markerTopRight,
+            "extracted top-right"
+        )
+        try expectImagePixel(
+            pixels,
+            0,
+            image.height - 1,
+            ModelSmokeRun.markerBottomLeft,
+            "extracted bottom-left"
+        )
+        try expectImagePixel(
+            pixels,
+            image.width - 1,
+            image.height - 1,
+            ModelSmokeRun.markerBottomRight,
+            "extracted bottom-right"
+        )
+        // Interior sample: the quadrant boundaries sit where the document puts
+        // them, not half a selection away.
+        try expectImagePixel(
+            pixels,
+            image.width / 2,
+            image.height / 2,
+            ModelSmokeRun.markerBottomRight,
+            "extracted interior"
+        )
+
+        // Read only: no pixels changed, no revision bump, no history entry.
+        try expectEqual(document.revision, revision, "revision after selectionImage")
+        try expectFlags(document, undo: false, redo: false, dirty: false)
+        try expectMarker(document, in: markerRect, "document after extraction")
+
+        // A marquee dragged up and to the left describes the same pixels.
+        let flipped = CGRect(
+            x: markerRect.maxX,
+            y: markerRect.maxY,
+            width: -markerRect.width,
+            height: -markerRect.height
+        )
+        let dragged = try requireSelection(document, flipped, "selection dragged up and left")
+        try expectEqual(dragged.width, Int(markerRect.width), "normalised selection width")
+        try expectEqual(dragged.height, Int(markerRect.height), "normalised selection height")
+        let draggedPixels = try raster(dragged)
+        try expectImagePixel(
+            draggedPixels,
+            0,
+            0,
+            ModelSmokeRun.markerTopLeft,
+            "normalised top-left"
+        )
+        try expectImagePixel(
+            draggedPixels,
+            dragged.width - 1,
+            dragged.height - 1,
+            ModelSmokeRun.markerBottomRight,
+            "normalised bottom-right"
+        )
+
+        // Fractional drags snap outward to whole pixels, so a selection never
+        // carries a partial pixel.
+        let fractional = CGRect(
+            x: markerRect.minX + 0.3,
+            y: markerRect.minY + 0.2,
+            width: markerRect.width - 0.6,
+            height: markerRect.height - 0.5
+        )
+        let snapped = try requireSelection(document, fractional, "fractional selection")
+        try expectEqual(snapped.width, Int(markerRect.width), "snapped selection width")
+        try expectEqual(snapped.height, Int(markerRect.height), "snapped selection height")
+
+        // Overhanging the canvas keeps only the pixels that exist.
+        let overhang = CGRect(x: -6, y: -6, width: 12, height: 12)
+        let clamped = try requireSelection(document, overhang, "selection overhanging a corner")
+        try expectEqual(clamped.width, 6, "clamped selection width")
+        try expectEqual(clamped.height, 6, "clamped selection height")
+
+        // Nothing selectable at all: nil, never a zero-sized image.
+        let rejected = [
+            CGRect(x: markerRect.minX, y: markerRect.minY, width: 0, height: markerRect.height),
+            CGRect(x: markerRect.minX, y: markerRect.minY, width: markerRect.width, height: 0),
+            CGRect(x: 100, y: 100, width: 8, height: 12),
+            CGRect(x: -20, y: 6, width: 8, height: 12),
+            CGRect(x: CGFloat.nan, y: 6, width: 8, height: 12),
+            CGRect(x: 4, y: 6, width: CGFloat.infinity, height: 12),
+        ]
+        for request in rejected {
+            try expect(
+                document.selectionImage(in: request) == nil,
+                "selectionImage(in: \(request)) must be nil, not an empty image"
+            )
+        }
+        try expectEqual(document.revision, revision, "revision after rejected selections")
+        try expectFlags(document, undo: false, redo: false, dirty: false)
+    }
+
+    /// Moving a selection: the pixels arrive exact and upright, the vacated
+    /// area takes the secondary colour, and the whole move is one undo entry.
+    private func selectionMove() throws {
+        let document = try markerDocument(rect: markerRect)
+        let revision = document.revision
+        let image = try requireSelection(document, markerRect, "marker selection")
+        let destination = markerRect.offsetBy(dx: 24, dy: -4)
+
+        document.transformSelection(
+            image,
+            from: markerRect,
+            to: destination,
+            rotation: 0,
+            background: ModelSmokeRun.selectionBackground
+        )
+
+        try expect(document.revision > revision, "a committed move must bump revision")
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+
+        // Whole pixels, no scaling: the marker must arrive exact, corners
+        // included, so a one-pixel or flipped redraw fails.
+        try expectMarker(document, in: destination, "moved marker")
+        try expectPixel(
+            document,
+            Int(destination.minX),
+            Int(destination.minY),
+            ModelSmokeRun.markerBottomLeft,
+            "moved marker corner"
+        )
+        try expectPixel(
+            document,
+            Int(destination.maxX) - 1,
+            Int(destination.maxY) - 1,
+            ModelSmokeRun.markerTopRight,
+            "moved marker opposite corner"
+        )
+
+        // Paint semantics: the whole vacated rectangle takes Color 2.
+        for point in [(4, 6), (11, 6), (4, 17), (11, 17), (7, 11)] {
+            try expectPixel(
+                document,
+                point.0,
+                point.1,
+                ModelSmokeRun.selectionBackground,
+                "vacated source pixel"
+            )
+        }
+        try expectPixel(document, 3, 9, .white, "page just left of the vacated area")
+        try expectPixel(document, 12, 9, .white, "page just right of the vacated area")
+        try expectPixel(document, 6, 5, .white, "page just below the vacated area")
+        try expectPixel(document, 6, 18, .white, "page just above the vacated area")
+        try expectPixel(
+            document,
+            Int(outsideRect.minX) + 1,
+            Int(outsideRect.minY) + 1,
+            ModelSmokeRun.outsideMark,
+            "unrelated content outside the selection"
+        )
+
+        // One history entry for the whole move: a single undo is pristine.
+        document.undo()
+        try expectFlags(document, undo: false, redo: true, dirty: false)
+        try expectMarker(document, in: markerRect, "marker restored by undo")
+        try expectPixel(
+            document,
+            Int(destination.minX) + 1,
+            Int(destination.minY) + 1,
+            .white,
+            "destination cleared by undo"
+        )
+
+        document.redo()
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expectMarker(document, in: destination, "marker restored by redo")
+        try expectPixel(
+            document,
+            6,
+            9,
+            ModelSmokeRun.selectionBackground,
+            "source stays vacated after redo"
+        )
+
+        // Overlapping move: the source is vacated *before* the draw, so the
+        // pixels that land back inside it survive and only the remainder shows
+        // background. Clearing afterwards would erase half the marker.
+        let overlapping = try markerDocument(rect: markerRect)
+        let selection = try requireSelection(overlapping, markerRect, "marker selection")
+        let shifted = markerRect.offsetBy(dx: markerRect.width / 2, dy: 0)
+        overlapping.transformSelection(
+            selection,
+            from: markerRect,
+            to: shifted,
+            rotation: 0,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectMarker(overlapping, in: shifted, "marker after an overlapping move")
+        try expectPixel(
+            overlapping,
+            5,
+            9,
+            ModelSmokeRun.selectionBackground,
+            "strip vacated by an overlapping move"
+        )
+        try expectFlags(overlapping, undo: true, redo: false, dirty: true)
+    }
+
+    /// Resizing a selection stretches it into the destination rectangle on both
+    /// axes independently, as one undo entry.
+    private func selectionResize() throws {
+        let document = try markerDocument(rect: markerRect)
+        let image = try requireSelection(document, markerRect, "marker selection")
+        // Three times wider, twice as tall: a transform that preserves the
+        // aspect ratio, ignores the destination size or swaps the axes fails.
+        let destination = CGRect(
+            x: 16,
+            y: 8,
+            width: markerRect.width * 3,
+            height: markerRect.height * 2
+        )
+
+        document.transformSelection(
+            image,
+            from: markerRect,
+            to: destination,
+            rotation: 0,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expectMarker(document, in: destination, "stretched marker", exact: false)
+
+        // The stretch fills the destination: a pixel in from every corner still
+        // belongs to that corner's quadrant.
+        try expectNearestColor(
+            document,
+            Int(destination.minX) + 1,
+            Int(destination.minY) + 1,
+            ModelSmokeRun.markerBottomLeft,
+            "stretched bottom-left corner"
+        )
+        try expectNearestColor(
+            document,
+            Int(destination.maxX) - 2,
+            Int(destination.minY) + 1,
+            ModelSmokeRun.markerBottomRight,
+            "stretched bottom-right corner"
+        )
+        try expectNearestColor(
+            document,
+            Int(destination.minX) + 1,
+            Int(destination.maxY) - 2,
+            ModelSmokeRun.markerTopLeft,
+            "stretched top-left corner"
+        )
+        try expectNearestColor(
+            document,
+            Int(destination.maxX) - 2,
+            Int(destination.maxY) - 2,
+            ModelSmokeRun.markerTopRight,
+            "stretched top-right corner"
+        )
+
+        // ...and nothing spilled past it.
+        try expectPixel(document, 15, 20, .white, "page left of the stretched marker")
+        try expectPixel(document, 41, 20, .white, "page right of the stretched marker")
+        try expectPixel(document, 22, 7, .white, "page below the stretched marker")
+        try expectPixel(document, 22, 33, .white, "page above the stretched marker")
+
+        try expectPixel(
+            document,
+            6,
+            9,
+            ModelSmokeRun.selectionBackground,
+            "vacated source after the stretch"
+        )
+        try expectPixel(
+            document,
+            10,
+            15,
+            ModelSmokeRun.selectionBackground,
+            "vacated source after the stretch"
+        )
+        try expectPixel(
+            document,
+            41,
+            3,
+            ModelSmokeRun.outsideMark,
+            "unrelated content after the stretch"
+        )
+
+        document.undo()
+        try expectFlags(document, undo: false, redo: true, dirty: false)
+        try expectMarker(document, in: markerRect, "marker restored by undo")
+        try expectPixel(document, 22, 14, .white, "destination cleared by undo")
+
+        document.redo()
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expectMarker(document, in: destination, "stretched marker after redo", exact: false)
+
+        // Shrinking is the same operation the other way round.
+        let shrunk = try markerDocument(rect: markerRect)
+        let selection = try requireSelection(shrunk, markerRect, "marker selection")
+        let small = CGRect(x: 20, y: 20, width: 4, height: 6)
+        shrunk.transformSelection(
+            selection,
+            from: markerRect,
+            to: small,
+            rotation: 0,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectMarker(shrunk, in: small, "shrunk marker", exact: false)
+        try expectPixel(
+            shrunk,
+            6,
+            9,
+            ModelSmokeRun.selectionBackground,
+            "vacated source after shrinking"
+        )
+        try expectFlags(shrunk, undo: true, redo: false, dirty: true)
+    }
+
+    /// Rotation turns counterclockwise around the destination's centre, at any
+    /// angle, as one undo entry.
+    private func selectionRotation() throws {
+        let document = try markerDocument(rect: squareMarkerRect)
+        let revision = document.revision
+        let image = try requireSelection(document, squareMarkerRect, "square marker selection")
+        let destination = squareMarkerRect.offsetBy(dx: 24, dy: 12)
+
+        // A quarter turn counterclockwise carries the marker's bottom-left
+        // quadrant to the destination's bottom-right. That is what makes the
+        // direction of rotation observable rather than assumed.
+        document.transformSelection(
+            image,
+            from: squareMarkerRect,
+            to: destination,
+            rotation: .pi / 2,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expect(document.revision > revision, "a committed rotation must bump revision")
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expectMarker(
+            document,
+            in: destination,
+            "marker turned a quarter counterclockwise",
+            rotatedBy: 1,
+            exact: false
+        )
+        try expectPixel(
+            document,
+            9,
+            9,
+            ModelSmokeRun.selectionBackground,
+            "vacated source after the rotation"
+        )
+        try expectPixel(
+            document,
+            15,
+            15,
+            ModelSmokeRun.selectionBackground,
+            "vacated source after the rotation"
+        )
+
+        document.undo()
+        try expectFlags(document, undo: false, redo: true, dirty: false)
+        try expectMarker(document, in: squareMarkerRect, "marker restored by undo")
+        try expectPixel(
+            document,
+            Int(destination.midX),
+            Int(destination.midY),
+            .white,
+            "destination cleared by undo"
+        )
+
+        document.redo()
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expectMarker(
+            document,
+            in: destination,
+            "marker after redoing the rotation",
+            rotatedBy: 1,
+            exact: false
+        )
+
+        // The opposite sign turns the other way: stated separately so a
+        // transform that rotates clockwise cannot satisfy both scenarios.
+        let clockwise = try markerDocument(rect: squareMarkerRect)
+        let clockwiseImage = try requireSelection(
+            clockwise,
+            squareMarkerRect,
+            "square marker selection"
+        )
+        clockwise.transformSelection(
+            clockwiseImage,
+            from: squareMarkerRect,
+            to: destination,
+            rotation: -.pi / 2,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectMarker(
+            clockwise,
+            in: destination,
+            "marker turned a quarter clockwise",
+            rotatedBy: -1,
+            exact: false
+        )
+
+        // Arbitrary angles are not a special case. At 45° the destination's own
+        // corners fall outside the rotated marker while its edge midpoints are
+        // overshot, so the committed pixels follow the turned outline instead
+        // of the axis-aligned box.
+        let diagonal = try markerDocument(rect: squareMarkerRect)
+        let diagonalImage = try requireSelection(
+            diagonal,
+            squareMarkerRect,
+            "square marker selection"
+        )
+        diagonal.transformSelection(
+            diagonalImage,
+            from: squareMarkerRect,
+            to: destination,
+            rotation: .pi / 4,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectFlags(diagonal, undo: true, redo: false, dirty: true)
+        try expect(
+            !(try isPage(diagonal, 28, 24)),
+            "a 45° rotation must paint past the destination rectangle's left edge"
+        )
+        try expectPixel(
+            diagonal,
+            Int(destination.minX),
+            Int(destination.minY),
+            .white,
+            "the destination's own corner falls outside a 45° rotation"
+        )
+
+        diagonal.undo()
+        try expectFlags(diagonal, undo: false, redo: true, dirty: false)
+        try expectMarker(diagonal, in: squareMarkerRect, "marker restored after a 45° rotation")
+        try expect(
+            try isPage(diagonal, 28, 24),
+            "one undo must clear every pixel a 45° rotation painted"
+        )
+    }
+
+    /// Deleting a selection repaints exactly its pixels with the secondary
+    /// colour, once, as one undo entry.
+    private func selectionDelete() throws {
+        let document = try markerDocument(rect: markerRect)
+        let revision = document.revision
+
+        document.deleteSelection(in: markerRect, background: ModelSmokeRun.selectionBackground)
+        try expect(document.revision > revision, "deleting a selection must bump revision")
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+
+        // Every pixel of the selection, edges and corners included.
+        for x in Int(markerRect.minX)..<Int(markerRect.maxX) {
+            for y in Int(markerRect.minY)..<Int(markerRect.maxY) {
+                try expectPixel(
+                    document,
+                    x,
+                    y,
+                    ModelSmokeRun.selectionBackground,
+                    "deleted selection pixel"
+                )
+            }
+        }
+        try expectPixel(document, 3, 9, .white, "page left of the deleted selection")
+        try expectPixel(document, 12, 9, .white, "page right of the deleted selection")
+        try expectPixel(document, 6, 5, .white, "page below the deleted selection")
+        try expectPixel(document, 6, 18, .white, "page above the deleted selection")
+        try expectPixel(
+            document,
+            41,
+            3,
+            ModelSmokeRun.outsideMark,
+            "unrelated content after a delete"
+        )
+
+        document.undo()
+        try expectFlags(document, undo: false, redo: true, dirty: false)
+        try expectMarker(document, in: markerRect, "marker restored by undo")
+
+        document.redo()
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expectPixel(
+            document,
+            6,
+            9,
+            ModelSmokeRun.selectionBackground,
+            "selection deleted again by redo"
+        )
+
+        // Clamped: a delete overhanging the canvas clears the pixels that exist
+        // and nothing else.
+        let clamped = try markerDocument(rect: markerRect)
+        clamped.deleteSelection(
+            in: CGRect(x: -4, y: -4, width: 8, height: 8),
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectFlags(clamped, undo: true, redo: false, dirty: true)
+        try expectPixel(
+            clamped,
+            0,
+            0,
+            ModelSmokeRun.selectionBackground,
+            "clamped delete clears the canvas corner"
+        )
+        try expectPixel(
+            clamped,
+            3,
+            3,
+            ModelSmokeRun.selectionBackground,
+            "clamped delete clears up to its edge"
+        )
+        try expectPixel(clamped, 4, 4, .white, "clamped delete stops at its edge")
+        try expectMarker(clamped, in: markerRect, "marker untouched by a clamped delete")
+
+        // Unusable geometry deletes nothing and records nothing.
+        let untouched = try markerDocument(rect: markerRect)
+        let quiet = untouched.revision
+        let rejected = [
+            CGRect(x: 4, y: 6, width: 0, height: 12),
+            CGRect(x: 4, y: 6, width: 8, height: 0),
+            CGRect(x: 100, y: 100, width: 8, height: 12),
+            CGRect(x: CGFloat.nan, y: 6, width: 8, height: 12),
+            CGRect(x: 4, y: CGFloat.infinity, width: 8, height: 12),
+        ]
+        for request in rejected {
+            untouched.deleteSelection(
+                in: request,
+                background: ModelSmokeRun.selectionBackground
+            )
+            try expectEqual(
+                untouched.revision,
+                quiet,
+                "revision after deleteSelection(in: \(request))"
+            )
+            try expectFlags(untouched, undo: false, redo: false, dirty: false)
+        }
+        try expectMarker(untouched, in: markerRect, "marker after rejected deletes")
+    }
+
+    /// A destination hanging off the canvas paints what fits, clears the whole
+    /// source and leaves the canvas dimensions alone.
+    private func selectionClipping() throws {
+        let document = try markerDocument(rect: markerRect)
+        let image = try requireSelection(document, markerRect, "marker selection")
+        // Dragged off the top-left: only the marker's bottom-right quadrant
+        // still lands on the canvas.
+        let destination = CGRect(
+            x: -4,
+            y: 30,
+            width: markerRect.width,
+            height: markerRect.height
+        )
+
+        document.transformSelection(
+            image,
+            from: markerRect,
+            to: destination,
+            rotation: 0,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectSize(document, selectionCanvas.width, selectionCanvas.height)
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expectPixel(
+            document,
+            0,
+            30,
+            ModelSmokeRun.markerBottomRight,
+            "clipped marker on the canvas"
+        )
+        try expectPixel(
+            document,
+            3,
+            35,
+            ModelSmokeRun.markerBottomRight,
+            "clipped marker at the canvas edge"
+        )
+        try expectPixel(document, 4, 33, .white, "page just beyond the clipped marker")
+        try expectPixel(document, 1, 29, .white, "page just below the clipped marker")
+
+        // The source is vacated in full even though most of the selection never
+        // reached the canvas.
+        try expectPixel(
+            document,
+            6,
+            9,
+            ModelSmokeRun.selectionBackground,
+            "vacated source after a clipped move"
+        )
+        try expectPixel(
+            document,
+            11,
+            17,
+            ModelSmokeRun.selectionBackground,
+            "vacated source after a clipped move"
+        )
+
+        document.undo()
+        try expectFlags(document, undo: false, redo: true, dirty: false)
+        try expectMarker(document, in: markerRect, "marker restored after a clipped move")
+        try expectPixel(document, 0, 30, .white, "clipped pixels cleared by undo")
+
+        document.redo()
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expectPixel(
+            document,
+            0,
+            30,
+            ModelSmokeRun.markerBottomRight,
+            "clipped marker after redo"
+        )
+
+        // A source rectangle that is itself off canvas has nothing to vacate,
+        // and must still draw what lands on the page.
+        let offCanvas = try markerDocument(rect: markerRect)
+        let selection = try requireSelection(offCanvas, markerRect, "marker selection")
+        let landing = CGRect(x: 20, y: 20, width: markerRect.width, height: markerRect.height)
+        offCanvas.transformSelection(
+            selection,
+            from: CGRect(x: 100, y: 100, width: markerRect.width, height: markerRect.height),
+            to: landing,
+            rotation: 0,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectFlags(offCanvas, undo: true, redo: false, dirty: true)
+        try expectMarker(offCanvas, in: landing, "marker drawn from an off-canvas source")
+        try expectMarker(offCanvas, in: markerRect, "marker left alone by an off-canvas source")
+    }
+
+    /// Requests that cannot change a pixel change neither the bitmap nor the
+    /// history: no revision bump, no undo entry, no dirty flag.
+    private func selectionNoOps() throws {
+        let document = try markerDocument(rect: markerRect)
+        let image = try requireSelection(document, markerRect, "marker selection")
+        let revision = document.revision
+
+        // Put back exactly where it came from, unrotated.
+        document.transformSelection(
+            image,
+            from: markerRect,
+            to: markerRect,
+            rotation: 0,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectEqual(document.revision, revision, "revision after an identity transform")
+        try expectFlags(document, undo: false, redo: false, dirty: false)
+        try expectMarker(document, in: markerRect, "marker after an identity transform")
+
+        // The same identity, reached from a rectangle dragged the other way and
+        // an angle far below one pixel of movement.
+        document.transformSelection(
+            image,
+            from: markerRect,
+            to: CGRect(
+                x: markerRect.maxX,
+                y: markerRect.maxY,
+                width: -markerRect.width,
+                height: -markerRect.height
+            ),
+            rotation: 1e-9,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectEqual(
+            document.revision,
+            revision,
+            "revision after a normalised identity transform"
+        )
+        try expectFlags(document, undo: false, redo: false, dirty: false)
+
+        // Degenerate, non-finite and wholly off-canvas geometry.
+        let rejected: [(source: CGRect, destination: CGRect, rotation: CGFloat)] = [
+            (markerRect, CGRect(x: 20, y: 20, width: 0, height: 12), 0),
+            (markerRect, CGRect(x: 20, y: 20, width: 8, height: 0), 0),
+            (markerRect, CGRect(x: CGFloat.nan, y: 20, width: 8, height: 12), 0),
+            (markerRect, CGRect(x: 20, y: 20, width: CGFloat.infinity, height: 12), 0),
+            (
+                CGRect(x: CGFloat.nan, y: 6, width: 8, height: 12),
+                CGRect(x: 20, y: 20, width: 8, height: 12),
+                0
+            ),
+            (markerRect, CGRect(x: 20, y: 20, width: 8, height: 12), CGFloat.nan),
+            (
+                CGRect(x: 100, y: 100, width: 8, height: 12),
+                CGRect(x: 200, y: 200, width: 8, height: 12),
+                0
+            ),
+        ]
+        for request in rejected {
+            document.transformSelection(
+                image,
+                from: request.source,
+                to: request.destination,
+                rotation: request.rotation,
+                background: ModelSmokeRun.selectionBackground
+            )
+            try expectEqual(
+                document.revision,
+                revision,
+                "revision after transformSelection(from: \(request.source), "
+                    + "to: \(request.destination), rotation: \(request.rotation))"
+            )
+            try expectFlags(document, undo: false, redo: false, dirty: false)
+        }
+        try expectMarker(document, in: markerRect, "marker after every rejected transform")
+        try expectPixel(
+            document,
+            41,
+            3,
+            ModelSmokeRun.outsideMark,
+            "unrelated content after every rejected transform"
+        )
+
+        // A real transform after all those rejections still records exactly one
+        // entry, so nothing above left a half-open operation behind.
+        document.transformSelection(
+            image,
+            from: markerRect,
+            to: markerRect.offsetBy(dx: 20, dy: 10),
+            rotation: 0,
+            background: ModelSmokeRun.selectionBackground
+        )
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        document.undo()
+        try expectFlags(document, undo: false, redo: true, dirty: false)
+        try expectMarker(document, in: markerRect, "marker restored after the one committed move")
+    }
+
+    // MARK: Selection helpers
+
+    /// A solid, axis-aligned block of a fixture bitmap, in bottom-left based
+    /// document pixels.
+    private struct Block {
+        let x: Int
+        let y: Int
+        let width: Int
+        let height: Int
+        let color: NSColor
+    }
+
+    /// Top-left based, unpremultiplied readback of a `CGImage`, so extracted
+    /// selection pixels can be inspected in the orientation the image itself
+    /// stores them.
+    private struct Raster {
+        let width: Int
+        let height: Int
+        let bytesPerRow: Int
+        let bytes: [UInt8]
+
+        func pixel(_ x: Int, _ y: Int) -> Pixel {
+            let base = y * bytesPerRow + x * 4
+            let alpha = Double(bytes[base + 3]) / 255
+            guard alpha > 0 else { return (0, 0, 0, 0) }
+            return (
+                min(1, Double(bytes[base]) / 255 / alpha),
+                min(1, Double(bytes[base + 1]) / 255 / alpha),
+                min(1, Double(bytes[base + 2]) / 255 / alpha),
+                alpha
+            )
+        }
+    }
+
+    /// Every colour the selection scenarios paint with. Interpolated pixels —
+    /// anything scaled or rotated — are judged by which of these they are
+    /// closest to, which identifies the quadrant without pinning an exact
+    /// blend.
+    private var selectionPalette: [(color: NSColor, name: String)] {
+        [
+            (ModelSmokeRun.markerBottomLeft, "marker bottom-left"),
+            (ModelSmokeRun.markerBottomRight, "marker bottom-right"),
+            (ModelSmokeRun.markerTopRight, "marker top-right"),
+            (ModelSmokeRun.markerTopLeft, "marker top-left"),
+            (ModelSmokeRun.outsideMark, "outside mark"),
+            (ModelSmokeRun.selectionBackground, "selection background"),
+            (.white, "page white"),
+        ]
+    }
+
+    /// A document holding the asymmetric four-quadrant marker inside `rect`, an
+    /// unrelated black block outside it and white everywhere else.
+    ///
+    /// Built as an image file and opened, so the fixture pixels are exact and
+    /// the document starts with empty history and a clean dirty flag: every
+    /// selection scenario can then count history entries from zero.
+    private func markerDocument(
+        rect: CGRect,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> PaintDocument {
+        let originX = Int(rect.minX)
+        let originY = Int(rect.minY)
+        let halfWidth = Int(rect.width) / 2
+        let halfHeight = Int(rect.height) / 2
+        let blocks = [
+            Block(
+                x: originX,
+                y: originY,
+                width: halfWidth,
+                height: halfHeight,
+                color: ModelSmokeRun.markerBottomLeft
+            ),
+            Block(
+                x: originX + halfWidth,
+                y: originY,
+                width: halfWidth,
+                height: halfHeight,
+                color: ModelSmokeRun.markerBottomRight
+            ),
+            Block(
+                x: originX + halfWidth,
+                y: originY + halfHeight,
+                width: halfWidth,
+                height: halfHeight,
+                color: ModelSmokeRun.markerTopRight
+            ),
+            Block(
+                x: originX,
+                y: originY + halfHeight,
+                width: halfWidth,
+                height: halfHeight,
+                color: ModelSmokeRun.markerTopLeft
+            ),
+            Block(
+                x: Int(outsideRect.minX),
+                y: Int(outsideRect.minY),
+                width: Int(outsideRect.width),
+                height: Int(outsideRect.height),
+                color: ModelSmokeRun.outsideMark
+            ),
+        ]
+
+        let document = try blockDocument(
+            width: selectionCanvas.width,
+            height: selectionCanvas.height,
+            blocks: blocks,
+            file: file,
+            line: line
+        )
+        // The fixture must really be what the scenarios assume, otherwise their
+        // expectations could pass for the wrong reason.
+        try expectSize(
+            document,
+            selectionCanvas.width,
+            selectionCanvas.height,
+            file: file,
+            line: line
+        )
+        try expectFlags(document, undo: false, redo: false, dirty: false, file: file, line: line)
+        try expectMarker(document, in: rect, "fixture marker", file: file, line: line)
+        try expectPixel(
+            document,
+            Int(outsideRect.minX) + 1,
+            Int(outsideRect.minY) + 1,
+            ModelSmokeRun.outsideMark,
+            "fixture mark outside the selection",
+            file: file,
+            line: line
+        )
+        return document
+    }
+
+    /// Writes `blocks` into a white bitmap, then opens it as a document. TIFF
+    /// is lossless, so the document holds exactly these pixels, and `open`
+    /// leaves it with no history and no unsaved changes.
+    private func blockDocument(
+        width: Int,
+        height: Int,
+        blocks: [Block],
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> PaintDocument {
+        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not allocate a \(width)×\(height) fixture bitmap",
+                file: file,
+                line: line
+            )
+        }
+
+        context.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        for block in blocks {
+            let want = try srgbComponents(block.color, file: file, line: line)
+            context.setFillColor(
+                CGColor(
+                    srgbRed: CGFloat(want.r),
+                    green: CGFloat(want.g),
+                    blue: CGFloat(want.b),
+                    alpha: CGFloat(want.a)
+                )
+            )
+            context.fill(
+                CGRect(x: block.x, y: block.y, width: block.width, height: block.height)
+            )
+        }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("paint-model-smoke-selection-\(UUID().uuidString).tiff")
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let image = context.makeImage(),
+              let destination = CGImageDestinationCreateWithURL(
+                  url as CFURL,
+                  "public.tiff" as CFString,
+                  1,
+                  nil
+              )
+        else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not create the selection fixture at \(url.path)",
+                file: file,
+                line: line
+            )
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not finalise the selection fixture at \(url.path)",
+                file: file,
+                line: line
+            )
+        }
+
+        let document = PaintDocument(width: width, height: height)
+        try document.open(url: url)
+        return document
+    }
+
+    /// The marker's oriented fingerprint inside `rect`: the four quadrant
+    /// colours, sampled at the quadrant centres.
+    ///
+    /// `quarterTurns` counts counterclockwise quarter turns of the content, so
+    /// a rotated selection is described by the same four colours in a shifted
+    /// order. `exact` compares colours outright — right for whole-pixel moves —
+    /// while a scaled or rotated marker is identified by proximity instead.
+    private func expectMarker(
+        _ document: PaintDocument,
+        in rect: CGRect,
+        _ label: String,
+        rotatedBy quarterTurns: Int = 0,
+        exact: Bool = true,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws {
+        let colors = [
+            ModelSmokeRun.markerBottomLeft,
+            ModelSmokeRun.markerBottomRight,
+            ModelSmokeRun.markerTopRight,
+            ModelSmokeRun.markerTopLeft,
+        ]
+        let corners = ["bottom-left", "bottom-right", "top-right", "top-left"]
+        let centres = [
+            CGPoint(x: rect.minX + rect.width / 4, y: rect.minY + rect.height / 4),
+            CGPoint(x: rect.maxX - rect.width / 4, y: rect.minY + rect.height / 4),
+            CGPoint(x: rect.maxX - rect.width / 4, y: rect.maxY - rect.height / 4),
+            CGPoint(x: rect.minX + rect.width / 4, y: rect.maxY - rect.height / 4),
+        ]
+        let turns = ((quarterTurns % 4) + 4) % 4
+
+        for index in centres.indices {
+            let x = Int(centres[index].x.rounded(.down))
+            let y = Int(centres[index].y.rounded(.down))
+            let expected = colors[(index - turns + 4) % 4]
+            let corner = "\(label): \(corners[index]) quadrant"
+            if exact {
+                try expectPixel(document, x, y, expected, corner, file: file, line: line)
+            } else {
+                try expectNearestColor(document, x, y, expected, corner, file: file, line: line)
+            }
+        }
+    }
+
+    /// Asserts the pixel is closer to `expected` than to any other colour the
+    /// selection scenarios paint with. Used where interpolation legitimately
+    /// blends edges, so the quadrant is still identified while a flip, a wrong
+    /// scale or a rotation the wrong way round still fails.
+    private func expectNearestColor(
+        _ document: PaintDocument,
+        _ x: Int,
+        _ y: Int,
+        _ expected: NSColor,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws {
+        let actual = try pixel(document, x, y, file: file, line: line)
+        let want = try srgbComponents(expected, file: file, line: line)
+        let expectedDistance = colorDistance(actual, want)
+
+        var nearest = (name: "", distance: Double.infinity)
+        for entry in selectionPalette {
+            let candidate = try srgbComponents(entry.color, file: file, line: line)
+            let distance = colorDistance(actual, candidate)
+            if distance < nearest.distance {
+                nearest = (entry.name, distance)
+            }
+        }
+
+        try expect(
+            expectedDistance <= nearest.distance + 1e-9,
+            "\(label) at (\(x), \(y)): \(format(actual)) is nearest \(nearest.name) "
+                + "(\(fixed(nearest.distance))), expected \(format(want)) "
+                + "(\(fixed(expectedDistance)))",
+            file: file,
+            line: line
+        )
+    }
+
+    private func expectImagePixel(
+        _ raster: Raster,
+        _ x: Int,
+        _ y: Int,
+        _ expected: NSColor,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws {
+        let actual = raster.pixel(x, y)
+        let want = try srgbComponents(expected, file: file, line: line)
+        let close = abs(actual.r - want.r) <= channelSlack
+            && abs(actual.g - want.g) <= channelSlack
+            && abs(actual.b - want.b) <= channelSlack
+            && abs(actual.a - want.a) <= channelSlack
+        try expect(
+            close,
+            "\(label) at image pixel (\(x), \(y)): got \(format(actual)), "
+                + "expected \(format(want))",
+            file: file,
+            line: line
+        )
+    }
+
+    /// True when the pixel is untouched page white.
+    private func isPage(
+        _ document: PaintDocument,
+        _ x: Int,
+        _ y: Int,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> Bool {
+        let sample = try pixel(document, x, y, file: file, line: line)
+        return sample.r >= 0.99 && sample.g >= 0.99 && sample.b >= 0.99 && sample.a >= 0.99
+    }
+
+    private func requireSelection(
+        _ document: PaintDocument,
+        _ rect: CGRect,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> CGImage {
+        guard let image = document.selectionImage(in: rect) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "\(label): selectionImage(in: \(rect)) returned nil",
+                file: file,
+                line: line
+            )
+        }
+        return image
+    }
+
+    /// Whole-image readback: one draw into a known layout, then plain byte
+    /// access, so per-pixel checks do not re-rasterise the image.
+    private func raster(
+        _ image: CGImage,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> Raster {
+        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(
+            data: nil,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let base = context.data else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not read back a \(image.width)×\(image.height) selection",
+                file: file,
+                line: line
+            )
+        }
+        context.draw(
+            image,
+            in: CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        )
+        let byteCount = context.bytesPerRow * image.height
+        let bytes = [UInt8](
+            UnsafeBufferPointer(
+                start: base.assumingMemoryBound(to: UInt8.self),
+                count: byteCount
+            )
+        )
+        return Raster(
+            width: image.width,
+            height: image.height,
+            bytesPerRow: context.bytesPerRow,
+            bytes: bytes
+        )
+    }
+
+    private func srgbComponents(
+        _ color: NSColor,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> Pixel {
+        guard let srgb = color.usingColorSpace(.sRGB) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "colour has no sRGB representation",
+                file: file,
+                line: line
+            )
+        }
+        return (
+            Double(srgb.redComponent),
+            Double(srgb.greenComponent),
+            Double(srgb.blueComponent),
+            Double(srgb.alphaComponent)
+        )
+    }
+
+    private func colorDistance(_ lhs: Pixel, _ rhs: Pixel) -> Double {
+        let red = lhs.r - rhs.r
+        let green = lhs.g - rhs.g
+        let blue = lhs.b - rhs.b
+        return (red * red + green * green + blue * blue).squareRoot()
     }
 
     // MARK: Shape helpers

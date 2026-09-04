@@ -9,6 +9,7 @@ import Foundation
 /// them over re-deriving membership.
 enum PaintTool: String, CaseIterable, Identifiable {
     // Drawing tools.
+    case select
     case pencil
     case brush
     case thickBrush
@@ -45,7 +46,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
 
     /// The freehand and sampling tools, in palette order.
     static let drawingTools: [PaintTool] = [
-        .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
+        .select, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
     ]
 
     /// The shape catalog, in the order the shape picker renders it.
@@ -61,7 +62,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// True for every tool drawn by dragging out a shape from `PaintShapeGeometry`.
     var isShape: Bool {
         switch self {
-        case .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text:
+        case .select, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text:
             return false
         case .line, .curve, .rectangle, .roundedRectangle, .ellipse,
             .triangle, .rightTriangle, .diamond, .pentagon, .hexagon,
@@ -76,6 +77,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// Human readable name shown in the toolbox, shape picker and menus.
     var title: String {
         switch self {
+        case .select: return "Select"
         case .pencil: return "Pencil"
         case .brush: return "Brush"
         case .thickBrush: return "Thick Brush"
@@ -112,6 +114,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// geometry preview; these names are the fallback and all exist on macOS 13.
     var symbolName: String {
         switch self {
+        case .select: return "cursorarrow.rays"
         case .pencil: return "pencil"
         case .brush: return "paintbrush.pointed.fill"
         case .thickBrush: return "paintbrush.fill"
@@ -150,6 +153,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// the letter keys to the tools that already own them.
     var shortcut: Character? {
         switch self {
+        case .select: return "s"
         case .pencil: return "p"
         case .brush: return "b"
         case .thickBrush: return nil
@@ -173,10 +177,10 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// the tool itself, so there is nothing to configure: Pencil is a single
     /// pixel, Brush is the medium stroke, Thick Brush is the deliberately broad
     /// marker, Eraser matches Brush exactly, and text and shapes share a fine
-    /// outline. Fill and Eyedropper never stroke, so their value is unused.
+    /// outline. Select, Fill and Eyedropper never stroke, so their value is unused.
     var strokeWidth: CGFloat {
         switch self {
-        case .pencil, .fill, .eyedropper: return 1
+        case .select, .pencil, .fill, .eyedropper: return 1
         case .brush, .eraser: return 16
         case .thickBrush: return 64
         case .text,

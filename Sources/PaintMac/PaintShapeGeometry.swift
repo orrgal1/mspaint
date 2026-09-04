@@ -28,7 +28,7 @@ enum PaintShapeGeometry {
             return CGPoint(x: from.x + cos(angle) * length, y: from.y + sin(angle) * length)
         case .curve:
             return to
-        case .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text:
+        case .select, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text:
             return to
         case .rectangle, .roundedRectangle, .ellipse, .triangle, .rightTriangle,
             .diamond, .pentagon, .hexagon, .rightArrow, .leftArrow, .upArrow,
@@ -140,7 +140,8 @@ enum PaintShapeGeometry {
             return ovalCalloutPath(in: rect)
         case .heart:
             return heartPath(in: rect)
-        case .line, .curve, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text:
+        case .line, .curve, .select, .pencil, .brush, .thickBrush, .eraser, .fill,
+            .eyedropper, .text:
             return nil
         }
     }
