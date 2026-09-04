@@ -35,7 +35,6 @@ final class PaintCanvasView: NSView {
     private var tool: PaintTool = .pencil
     private var primaryColor: NSColor = .black
     private var secondaryColor: NSColor = .white
-    private var lineWidth: CGFloat = 1
     private var zoom: CGFloat = 1
 
     /// Reports the pointer position in document space, or `nil` once the pointer leaves.
@@ -44,8 +43,6 @@ final class PaintCanvasView: NSView {
     var onPickColor: ((NSColor, Bool) -> Void)?
     /// Requests a tool change from a bare-key shortcut handled by this view.
     var onSelectTool: ((PaintTool) -> Void)?
-    /// Requests a brush size nudge (in points) from the `[` and `]` shortcuts.
-    var onBrushSizeDelta: ((Double) -> Void)?
 
     init(document: PaintDocument) {
         self.document = document
@@ -66,7 +63,6 @@ final class PaintCanvasView: NSView {
         tool newTool: PaintTool,
         primaryColor newPrimary: NSColor,
         secondaryColor newSecondary: NSColor,
-        lineWidth newLineWidth: CGFloat,
         zoom newZoom: CGFloat
     ) {
         if newDocument !== document {
@@ -83,7 +79,6 @@ final class PaintCanvasView: NSView {
 
         primaryColor = newPrimary
         secondaryColor = newSecondary
-        lineWidth = max(1, newLineWidth)
 
         let clampedZoom = max(0.1, newZoom)
         if clampedZoom != zoom {
@@ -184,7 +179,7 @@ final class PaintCanvasView: NSView {
         context.setShouldAntialias(true)
         context.scaleBy(x: zoom, y: zoom)
         context.setStrokeColor(color.cgColor)
-        context.setLineWidth(max(1, lineWidth))
+        context.setLineWidth(tool.strokeWidth)
         context.setLineJoin(.miter)
         context.setLineCap(tool == .line ? .round : .square)
         context.addPath(path)
@@ -258,8 +253,7 @@ final class PaintCanvasView: NSView {
                 to: point,
                 tool: tool,
                 color: color,
-                secondaryColor: alternate,
-                lineWidth: lineWidth
+                secondaryColor: alternate
             )
         case .fill:
             gesture = .idle
@@ -292,8 +286,7 @@ final class PaintCanvasView: NSView {
                 to: point,
                 tool: tool,
                 color: color,
-                secondaryColor: alternate,
-                lineWidth: lineWidth
+                secondaryColor: alternate
             )
             lastPoint = point
         case .shape:
@@ -319,8 +312,7 @@ final class PaintCanvasView: NSView {
                     to: point,
                     tool: tool,
                     color: color,
-                    secondaryColor: alternate,
-                    lineWidth: lineWidth
+                    secondaryColor: alternate
                 )
             }
             document.endStroke()
@@ -332,7 +324,6 @@ final class PaintCanvasView: NSView {
                 from: shapeStart,
                 to: shapeEnd,
                 color: color,
-                lineWidth: lineWidth,
                 constrained: shiftHeld
             )
         case .idle:
@@ -373,9 +364,9 @@ final class PaintCanvasView: NSView {
     /// Modifiers that always belong to menus, text editing or system gestures.
     private static let reservedModifiers: NSEvent.ModifierFlags = [.command, .control, .option]
 
-    /// Bare-key tool and brush size shortcuts, deliberately scoped to `keyDown` on the
-    /// focused canvas. Registering them as application key equivalents would swallow
-    /// plain letters typed into the text-insert and resize fields.
+    /// Bare-key tool shortcuts, deliberately scoped to `keyDown` on the focused
+    /// canvas. Registering them as application key equivalents would swallow plain
+    /// letters typed into the text-insert and resize fields.
     private func handleCanvasShortcut(_ event: NSEvent) -> Bool {
         guard let window, window.isKeyWindow, window.firstResponder === self else { return false }
 
@@ -386,21 +377,12 @@ final class PaintCanvasView: NSView {
               let character = typed.lowercased().first
         else { return false }
 
-        switch character {
-        case "[", "{":
-            onBrushSizeDelta?(-1)
-            return true
-        case "]", "}":
-            onBrushSizeDelta?(1)
-            return true
-        default:
-            guard let selected = PaintTool.allCases.first(where: { candidate in
-                guard let shortcut = candidate.shortcut else { return false }
-                return shortcut == character
-            }) else { return false }
-            onSelectTool?(selected)
-            return true
-        }
+        guard let selected = PaintTool.allCases.first(where: { candidate in
+            guard let shortcut = candidate.shortcut else { return false }
+            return shortcut == character
+        }) else { return false }
+        onSelectTool?(selected)
+        return true
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -429,6 +411,11 @@ final class PaintCanvasView: NSView {
 
     // MARK: Text entry
 
+    /// Text is scaled from the Text tool's own outline width, the same way every
+    /// other tool derives its footprint from `PaintTool.strokeWidth`, with a floor
+    /// that keeps inserted glyphs legible.
+    private static let textFontSize: CGFloat = max(12, PaintTool.text.strokeWidth * 6)
+
     private func presentTextEntry(at point: CGPoint, color: NSColor) {
         let alert = NSAlert()
         alert.messageText = "Insert Text"
@@ -446,7 +433,7 @@ final class PaintCanvasView: NSView {
         let text = field.stringValue
         guard !text.isEmpty else { return }
 
-        document.addText(text, at: point, color: color, fontSize: max(9, lineWidth * 6))
+        document.addText(text, at: point, color: color, fontSize: Self.textFontSize)
     }
 
     // MARK: Cursor tracking
@@ -498,15 +485,159 @@ final class PaintCanvasView: NSView {
         addCursorRect(bounds, cursor: Self.cursor(for: tool))
     }
 
+    /// Always the tool's own artwork: the cache covers every case of `PaintTool`, and
+    /// the miss branch renders the same icon rather than degrading to a system cursor.
     private static func cursor(for tool: PaintTool) -> NSCursor {
-        switch tool {
-        case .text:
-            return .iBeam
-        case .fill, .eyedropper:
-            return .pointingHand
-        default:
-            return .crosshair
+        if let cached = toolCursors[tool] { return cached }
+        return makeCursor(for: tool)
+    }
+
+    /// One immutable cursor per tool, rendered once and reused for the rest of the
+    /// session. Selecting a tool invalidates the canvas cursor rects, so rendering
+    /// on demand would redraw the very same artwork on every hover.
+    private static let toolCursors: [PaintTool: NSCursor] = {
+        var cursors = [PaintTool: NSCursor](minimumCapacity: PaintTool.allCases.count)
+        for tool in PaintTool.allCases {
+            cursors[tool] = PaintCanvasView.makeCursor(for: tool)
         }
+        return cursors
+    }()
+
+    /// Cursor artwork: a compact 32pt square carrying the aiming cross on the hot
+    /// spot near the top left corner and the tool's own icon below and right of it,
+    /// drawn white over a black rim so both read on light and dark canvases.
+    private static let cursorSide: CGFloat = 32
+    private static let cursorHotSpot = NSPoint(x: 4, y: 4)
+    private static let cursorGlyphBox = CGRect(x: 11, y: 3, width: 18, height: 18)
+    private static let cursorRimWidth: CGFloat = 3
+    private static let cursorCoreWidth: CGFloat = 1.4
+
+    private static func makeCursor(for tool: PaintTool) -> NSCursor {
+        let image = NSImage(
+            size: NSSize(width: cursorSide, height: cursorSide),
+            flipped: false
+        ) { _ in
+            guard let context = NSGraphicsContext.current?.cgContext else { return true }
+            PaintCanvasView.drawAimingMark(in: context)
+            PaintCanvasView.drawGlyph(for: tool, in: context)
+            return true
+        }
+        return NSCursor(image: image, hotSpot: cursorHotSpot)
+    }
+
+    /// The aiming cross, centred exactly on the hot spot. `hotSpot` is measured from
+    /// the top left, the image draws from the bottom left, hence the flip.
+    private static func drawAimingMark(in context: CGContext) {
+        let center = CGPoint(x: cursorHotSpot.x, y: cursorSide - cursorHotSpot.y)
+        let arm: CGFloat = 4
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: center.x - arm, y: center.y))
+        path.addLine(to: CGPoint(x: center.x + arm, y: center.y))
+        path.move(to: CGPoint(x: center.x, y: center.y - arm))
+        path.addLine(to: CGPoint(x: center.x, y: center.y + arm))
+        strokeHighContrast(path, in: context, cap: .butt)
+    }
+
+    /// Shapes draw the very outline they will stroke onto the canvas, from the shared
+    /// `PaintShapeGeometry`; every other tool draws its own SF Symbol.
+    private static func drawGlyph(for tool: PaintTool, in context: CGContext) {
+        if tool.isShape,
+            let path = PaintShapeGeometry.path(
+                tool: tool,
+                from: CGPoint(x: cursorGlyphBox.minX, y: cursorGlyphBox.minY),
+                to: CGPoint(x: cursorGlyphBox.maxX, y: cursorGlyphBox.maxY),
+                constrained: false
+            )
+        {
+            strokeHighContrast(path, in: context, cap: .round)
+            return
+        }
+
+        if let symbol = symbolImage(for: tool) {
+            drawSymbol(symbol, in: cursorGlyphBox)
+            return
+        }
+
+        strokeHighContrast(strokeWidthDisc(for: tool), in: context, cap: .round)
+    }
+
+    private static func symbolImage(for tool: PaintTool) -> NSImage? {
+        guard let symbol = NSImage(
+            systemSymbolName: tool.symbolName,
+            accessibilityDescription: tool.title
+        ) else { return nil }
+        let configured = symbol.withSymbolConfiguration(
+            NSImage.SymbolConfiguration(pointSize: 15, weight: .bold)
+        ) ?? symbol
+        configured.isTemplate = true
+        return configured
+    }
+
+    /// Fits the symbol into the glyph box and rings it with a black rim, so a white
+    /// icon stays legible against white paint.
+    private static func drawSymbol(_ image: NSImage, in box: CGRect) {
+        let size = image.size
+        guard size.width > 0, size.height > 0 else { return }
+
+        let scale = min(box.width / size.width, box.height / size.height)
+        let fitted = CGRect(
+            x: box.midX - size.width * scale / 2,
+            y: box.midY - size.height * scale / 2,
+            width: size.width * scale,
+            height: size.height * scale
+        )
+
+        let rim = tinted(image, with: .black)
+        let offset: CGFloat = 1.25
+        let offsets: [CGFloat] = [-offset, 0, offset]
+        for dx in offsets {
+            for dy in offsets where dx != 0 || dy != 0 {
+                rim.draw(in: fitted.offsetBy(dx: dx, dy: dy))
+            }
+        }
+        tinted(image, with: .white).draw(in: fitted)
+    }
+
+    /// A flat single-color copy of a template symbol, so rim and core come from the
+    /// same artwork.
+    private static func tinted(_ image: NSImage, with color: NSColor) -> NSImage {
+        let copy = NSImage(size: image.size, flipped: false) { rect in
+            image.draw(in: rect)
+            color.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        copy.isTemplate = false
+        return copy
+    }
+
+    /// Fallback artwork for a tool whose symbol will not load: a disc sized by the
+    /// tool's own stroke width, so the cursor still says something true about it.
+    private static func strokeWidthDisc(for tool: PaintTool) -> CGPath {
+        let diameter = min(cursorGlyphBox.width, max(5, tool.strokeWidth))
+        let rect = CGRect(
+            x: cursorGlyphBox.midX - diameter / 2,
+            y: cursorGlyphBox.midY - diameter / 2,
+            width: diameter,
+            height: diameter
+        )
+        return CGPath(ellipseIn: rect, transform: nil)
+    }
+
+    private static func strokeHighContrast(_ path: CGPath, in context: CGContext, cap: CGLineCap) {
+        context.saveGState()
+        context.setShouldAntialias(true)
+        context.setLineCap(cap)
+        context.setLineJoin(.round)
+        context.setStrokeColor(NSColor.black.cgColor)
+        context.setLineWidth(cursorRimWidth)
+        context.addPath(path)
+        context.strokePath()
+        context.setStrokeColor(NSColor.white.cgColor)
+        context.setLineWidth(cursorCoreWidth)
+        context.addPath(path)
+        context.strokePath()
+        context.restoreGState()
     }
 }
 
@@ -517,7 +648,6 @@ struct PaintCanvasRepresentable: NSViewRepresentable {
     @Binding var tool: PaintTool
     @Binding var primaryColor: Color
     @Binding var secondaryColor: Color
-    @Binding var brushSize: Double
     @Binding var zoom: Double
     @Binding var cursorPosition: CGPoint?
 
@@ -534,7 +664,6 @@ struct PaintCanvasRepresentable: NSViewRepresentable {
             tool: tool,
             primaryColor: NSColor(primaryColor),
             secondaryColor: NSColor(secondaryColor),
-            lineWidth: CGFloat(brushSize),
             zoom: CGFloat(zoom)
         )
     }
@@ -562,18 +691,6 @@ struct PaintCanvasRepresentable: NSViewRepresentable {
         view.onSelectTool = { selected in
             if toolBinding.wrappedValue != selected {
                 toolBinding.wrappedValue = selected
-            }
-        }
-
-        let brushBinding = $brushSize
-        view.onBrushSizeDelta = { delta in
-            let options = PaintSession.brushSizeOptions
-            guard !options.isEmpty else { return }
-            let currentIndex = options.firstIndex(where: { $0 >= brushBinding.wrappedValue }) ?? options.count - 1
-            let nextIndex = min(max(currentIndex + (delta > 0 ? 1 : -1), 0), options.count - 1)
-            let next = options[nextIndex]
-            if brushBinding.wrappedValue != next {
-                brushBinding.wrappedValue = next
             }
         }
     }

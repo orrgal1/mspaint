@@ -169,20 +169,24 @@ enum PaintTool: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Smallest stroke width the tool is allowed to draw with. Thick Brush is a
-    /// deliberately broad marker, so it clamps well above the manual minimum;
-    /// every other tool can go all the way down to a single pixel.
-    var minimumStrokeWidth: CGFloat {
+    /// The one stroke width the tool always draws with. Width is a property of
+    /// the tool itself, so there is nothing to configure: Pencil is a single
+    /// pixel, Brush is the medium stroke, Thick Brush is the deliberately broad
+    /// marker, Eraser matches Brush exactly, and text and shapes share a fine
+    /// outline. Fill and Eyedropper never stroke, so their value is unused.
+    var strokeWidth: CGFloat {
         switch self {
+        case .pencil, .fill, .eyedropper: return 1
+        case .brush, .eraser: return 16
         case .thickBrush: return 64
-        case .pencil, .brush, .eraser, .fill, .eyedropper, .text,
+        case .text,
             .line, .curve, .rectangle, .roundedRectangle, .ellipse,
             .triangle, .rightTriangle, .diamond, .pentagon, .hexagon,
             .rightArrow, .leftArrow, .upArrow, .downArrow,
             .fourPointStar, .fivePointStar, .sixPointStar,
             .rectangularCallout, .roundedCallout, .ovalCallout,
             .heart, .lightning:
-            return 1
+            return 4
         }
     }
 }

@@ -178,34 +178,24 @@ final class PaintDocument: ObservableObject {
         to end: CGPoint,
         tool: PaintTool,
         color: NSColor,
-        secondaryColor: NSColor,
-        lineWidth: CGFloat
+        secondaryColor: NSColor
     ) {
         let paint: NSColor
-        let width: CGFloat
         let cap: CGLineCap
 
         switch tool {
-        case .pencil:
+        case .pencil, .brush, .thickBrush:
             paint = color
-            width = 1
-            cap = .round
-        case .brush:
-            paint = color
-            width = max(1, lineWidth)
-            cap = .round
-        case .thickBrush:
-            paint = color
-            width = max(lineWidth, tool.minimumStrokeWidth)
             cap = .round
         case .eraser:
             paint = secondaryColor
-            width = max(1, lineWidth)
             cap = .square
         default:
             // Not freehand tools: they commit through their own entry points.
             return
         }
+
+        let width = tool.strokeWidth
 
         let context = buffer.context
         context.saveGState()
@@ -277,7 +267,6 @@ final class PaintDocument: ObservableObject {
         from start: CGPoint,
         to end: CGPoint,
         color: NSColor,
-        lineWidth: CGFloat,
         constrained: Bool
     ) {
         guard tool.isShape else { return }
@@ -296,7 +285,7 @@ final class PaintDocument: ObservableObject {
         context.saveGState()
         context.setShouldAntialias(true)
         context.setStrokeColor(PaintDocument.cgColor(color))
-        context.setLineWidth(max(1, lineWidth))
+        context.setLineWidth(tool.strokeWidth)
         context.setLineJoin(.miter)
         context.setLineCap(tool == .line ? .round : .square)
         context.addPath(path)

@@ -42,6 +42,20 @@ private let channelSlack = 2.0 / 255.0
 /// remnant of an undone stroke by a wide margin.
 private let inkChannelCeiling = 0.35
 
+/// Per-channel floor for "this pixel was cleared back to the page". Used to
+/// measure the Eraser, whose band is only visible against inked pixels; the
+/// floor sits well above any antialiased fringe of the surrounding ink.
+private let clearChannelFloor = 0.65
+
+/// Slack, in whole pixels, allowed when comparing a painted cross-section
+/// against the tool's declared `strokeWidth`. Antialiasing can shave a row off
+/// either edge, so the band is measured proportionally: tight enough that a
+/// tool drawing at any other tool's width fails, loose enough that rasterising
+/// a correct width never does.
+private func paintedWidthSlack(_ expected: Int) -> Int {
+    max(1, expected / 8)
+}
+
 // MARK: - Shape catalogue expectations
 
 /// The shape catalogue this build must expose, in palette order. Spelled out
@@ -63,9 +77,24 @@ private let expectedDrawingTools: [PaintTool] = [
     .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
 ]
 
-/// The floor every tool imposes on a requested stroke width. Thick Brush is
-/// thick by construction; everything else may go down to a single pixel.
-private let expectedMinimumStrokeWidths: [PaintTool: CGFloat] = [.thickBrush: 64]
+/// The one width every tool draws with, spelled out literally instead of read
+/// back from `PaintTool`, so a tool that silently changes thickness fails here
+/// rather than agreeing with itself. Width is embodied by the tool: Pencil is a
+/// single pixel, Brush is the medium stroke, Thick Brush is the broad marker,
+/// Eraser matches Brush exactly, and Text and every shape share one fine
+/// outline. Fill and Eyedropper never stroke, so their value is unused.
+private let expectedStrokeWidths: [PaintTool: CGFloat] = [
+    .pencil: 1, .fill: 1, .eyedropper: 1,
+    .brush: 16, .eraser: 16,
+    .thickBrush: 64,
+    .text: 4,
+    .line: 4, .curve: 4, .rectangle: 4, .roundedRectangle: 4, .ellipse: 4,
+    .triangle: 4, .rightTriangle: 4, .diamond: 4, .pentagon: 4, .hexagon: 4,
+    .rightArrow: 4, .leftArrow: 4, .upArrow: 4, .downArrow: 4,
+    .fourPointStar: 4, .fivePointStar: 4, .sixPointStar: 4,
+    .rectangularCallout: 4, .roundedCallout: 4, .ovalCallout: 4,
+    .heart: 4, .lightning: 4,
+]
 
 /// The bare-key shortcuts that shipped before the catalogue grew. Every other
 /// tool must report `nil` rather than claim a key of its own.
@@ -203,6 +232,7 @@ final class ModelSmokeRun {
         try scenario("initial document") { try initialDocument() }
         try scenario("brush stroke checkpoint") { try brushStrokeCheckpoint() }
         try scenario("thick brush stroke") { try thickBrushStroke() }
+        try scenario("embodied stroke widths") { try embodiedStrokeWidths() }
         try scenario("cancelled stroke") { try cancelledStroke() }
         try scenario("no-op fill") { try noOpFill() }
         try scenario("bounded flood fill") { try boundedFloodFill() }
@@ -417,6 +447,54 @@ final class ModelSmokeRun {
         return longest
     }
 
+    /// Longest run of consecutive cleared pixels down column `x`. The Eraser
+    /// paints the page colour, so its band is measured against an inked canvas
+    /// exactly as the ink tools are measured against a blank one.
+    private func verticalClearRun(_ document: PaintDocument, column x: Int) throws -> Int {
+        var longest = 0
+        var current = 0
+        for y in 0..<document.pixelHeight {
+            let sample = try pixel(document, x, y)
+            if sample.r >= clearChannelFloor
+                && sample.g >= clearChannelFloor
+                && sample.b >= clearChannelFloor {
+                current += 1
+                longest = max(longest, current)
+            } else {
+                current = 0
+            }
+        }
+        return longest
+    }
+
+    /// Asserts a measured cross-section matches the width the tool embodies.
+    /// Phrased against `tool.strokeWidth` and the literal table together, so
+    /// neither a wrong constant nor a renderer ignoring it can pass.
+    private func expectPaintedWidth(
+        _ measured: Int,
+        _ tool: PaintTool,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws {
+        let declared = Int(tool.strokeWidth)
+        try expect(
+            declared == Int(expectedStrokeWidths[tool] ?? -1),
+            "\(tool.rawValue) strokeWidth is \(tool.strokeWidth), expected "
+                + "\(describe(expectedStrokeWidths[tool]))",
+            file: file,
+            line: line
+        )
+        try expect(
+            abs(measured - declared) <= paintedWidthSlack(declared),
+            "\(label): \(tool.rawValue) painted a \(measured)px cross-section, expected "
+                + "about \(declared)px — the width it embodies "
+                + "(±\(paintedWidthSlack(declared))px)",
+            file: file,
+            line: line
+        )
+    }
+
     private func fixed(_ value: Double) -> String {
         String(format: "%.3f", value)
     }
@@ -431,8 +509,7 @@ final class ModelSmokeRun {
         _ document: PaintDocument,
         at point: CGPoint,
         tool: PaintTool = .pencil,
-        color: NSColor = .black,
-        lineWidth: CGFloat = 1
+        color: NSColor = .black
     ) {
         document.beginStroke()
         document.drawStroke(
@@ -440,11 +517,38 @@ final class ModelSmokeRun {
             to: point,
             tool: tool,
             color: color,
-            secondaryColor: .white,
-            lineWidth: lineWidth
+            secondaryColor: .white
         )
         document.endStroke()
     }
+
+    /// One transaction of three horizontal drag segments centred on `centerY`,
+    /// wide enough that column `sampleColumn` lands in the middle of the band
+    /// rather than under an end cap. `centerY` sits on a pixel boundary so an
+    /// even-width band covers whole rows.
+    private func horizontalDrag(
+        _ document: PaintDocument,
+        tool: PaintTool,
+        centerY: Double,
+        color: NSColor = .black,
+        secondaryColor: NSColor = .white
+    ) {
+        document.beginStroke()
+        for step in 0..<3 {
+            let x = 60.0 + Double(step) * 12.0
+            document.drawStroke(
+                from: CGPoint(x: x, y: centerY),
+                to: CGPoint(x: x + 12, y: centerY),
+                tool: tool,
+                color: color,
+                secondaryColor: secondaryColor
+            )
+        }
+        document.endStroke()
+    }
+
+    /// Column that `horizontalDrag` guarantees is interior to the painted band.
+    private let sampleColumn = 78
 
     // MARK: Scenarios
 
@@ -472,14 +576,18 @@ final class ModelSmokeRun {
                 to: CGPoint(x: x + 4, y: 32),
                 tool: .brush,
                 color: .black,
-                secondaryColor: .white,
-                lineWidth: 6
+                secondaryColor: .white
             )
         }
         document.endStroke()
 
         try expect(document.revision > revisionBefore, "painting must bump revision")
         try expectInk(document, 20, 32, "brush ink")
+        try expectPaintedWidth(
+            try verticalInkRun(document, column: 20),
+            .brush,
+            "brush band"
+        )
         try expectPixel(document, 2, 2, .white, "untouched pixel")
         try expectFlags(document, undo: true, redo: false, dirty: true)
 
@@ -494,91 +602,140 @@ final class ModelSmokeRun {
 
     /// Thick Brush must be unmistakably thick and behave like Brush otherwise.
     ///
-    /// The stroke is requested at 4pt — the width an ordinary brush would honour
-    /// literally — so this fails if the model ever stops enforcing the tool's
-    /// own minimum for callers that reach `drawStroke` directly.
+    /// Nothing here requests a width: `drawStroke` takes none, so the band on
+    /// the bitmap can only come from the tool. The measured cross-section is
+    /// checked against `PaintTool.thickBrush.strokeWidth`, which fails if the
+    /// broad marker ever renders at the medium brush's width or vice versa.
     private func thickBrushStroke() throws {
-        let document = PaintDocument(width: 160, height: 160)
+        let document = PaintDocument(width: 200, height: 200)
         let revisionBefore = document.revision
-        let minimum = Int(PaintTool.thickBrush.minimumStrokeWidth)
+        let thickness = Int(PaintTool.thickBrush.strokeWidth)
 
         // One transaction, three drag segments along a horizontal line: history
         // must gain exactly one entry, and the painted band must be as tall as
-        // the tool's minimum regardless of the requested width.
-        document.beginStroke()
-        for step in 0..<3 {
-            let x = 48.0 + Double(step) * 8.0
-            document.drawStroke(
-                from: CGPoint(x: x, y: 80),
-                to: CGPoint(x: x + 8, y: 80),
-                tool: .thickBrush,
-                color: .black,
-                secondaryColor: .white,
-                lineWidth: 4
-            )
-        }
-        document.endStroke()
+        // the tool itself is.
+        horizontalDrag(document, tool: .thickBrush, centerY: 100)
 
         try expect(document.revision > revisionBefore, "thick brush must bump revision")
-        try expectInk(document, 60, 80, "thick brush core")
-        try expectInk(document, 60, 80 - minimum / 2 + 1, "thick brush band, one edge")
-        try expectInk(document, 60, 80 + minimum / 2 - 1, "thick brush band, other edge")
-
-        let thickRun = try verticalInkRun(document, column: 60)
-        try expect(
-            thickRun >= minimum,
-            "thick brush cross-section is \(thickRun)px of solid ink, expected at least \(minimum)px"
+        try expectInk(document, sampleColumn, 100, "thick brush core")
+        try expectInk(document, sampleColumn, 100 - thickness / 2 + 1, "thick brush band, one edge")
+        try expectInk(
+            document,
+            sampleColumn,
+            100 + thickness / 2 - 1,
+            "thick brush band, other edge"
         )
-        try expectPixel(document, 60, 4, .white, "canvas above the thick band")
-        try expectPixel(document, 4, 80, .white, "canvas beside the thick band")
+
+        let thickRun = try verticalInkRun(document, column: sampleColumn)
+        try expectPaintedWidth(thickRun, .thickBrush, "thick brush band")
+        try expectPixel(document, sampleColumn, 4, .white, "canvas above the thick band")
+        try expectPixel(document, 4, 100, .white, "canvas beside the thick band")
         try expectFlags(document, undo: true, redo: false, dirty: true)
 
-        // The same 4pt request through the ordinary brush stays thin, so the
-        // width above comes from the tool and not from a global floor.
-        let thin = PaintDocument(width: 160, height: 160)
-        thin.beginStroke()
-        for step in 0..<3 {
-            let x = 48.0 + Double(step) * 8.0
-            thin.drawStroke(
-                from: CGPoint(x: x, y: 80),
-                to: CGPoint(x: x + 8, y: 80),
-                tool: .brush,
-                color: .black,
-                secondaryColor: .white,
-                lineWidth: 4
-            )
-        }
-        thin.endStroke()
-        let thinRun = try verticalInkRun(thin, column: 60)
+        // The identical drag through the ordinary brush stays four times
+        // narrower: thickness belongs to the tool, not to a shared setting.
+        let medium = PaintDocument(width: 200, height: 200)
+        horizontalDrag(medium, tool: .brush, centerY: 100)
+        let mediumRun = try verticalInkRun(medium, column: sampleColumn)
+        try expectPaintedWidth(mediumRun, .brush, "ordinary brush band")
         try expect(
-            thinRun >= 1 && thinRun <= 8,
-            "ordinary 4pt brush cross-section is \(thinRun)px of solid ink, expected 1...8px"
+            thickRun > mediumRun * 3,
+            "thick brush painted \(thickRun)px against the brush's \(mediumRun)px; "
+                + "Thick Brush must be dramatically broader"
         )
 
         // One checkpoint for the whole drag: a single undo reaches the pristine
-        // bitmap, and redo brings the full-width band back.
+        // bitmap, and a single redo brings the full-width band back.
         document.undo()
-        try expectPixel(document, 60, 80, .white, "undone thick brush core")
+        try expectPixel(document, sampleColumn, 100, .white, "undone thick brush core")
         try expectEqual(
-            try verticalInkRun(document, column: 60),
+            try verticalInkRun(document, column: sampleColumn),
             0,
-            "solid ink pixels remaining after undo"
+            "solid ink pixels remaining after one undo"
         )
         try expectFlags(document, undo: false, redo: true, dirty: false)
 
         document.redo()
-        try expectInk(document, 60, 80, "redone thick brush core")
-        let redoneRun = try verticalInkRun(document, column: 60)
-        try expect(
-            redoneRun >= minimum,
-            "redone thick brush cross-section is \(redoneRun)px, expected at least \(minimum)px"
+        try expectInk(document, sampleColumn, 100, "redone thick brush core")
+        try expectPaintedWidth(
+            try verticalInkRun(document, column: sampleColumn),
+            .thickBrush,
+            "redone thick brush band"
         )
         try expectFlags(document, undo: true, redo: false, dirty: true)
     }
 
+    /// Every tool that puts marks on the bitmap paints exactly the width it
+    /// embodies — 1pt Pencil, 16pt Brush, 64pt Thick Brush, 16pt Eraser and
+    /// 4pt shapes — measured off the rendered pixels rather than trusted from
+    /// the enum. No entry point accepts a width, so a document that paints the
+    /// wrong band has no setting left to blame.
+    private func embodiedStrokeWidths() throws {
+        // Pencil: a single pixel. Its centre line sits mid-pixel so an
+        // odd-width band covers one whole row instead of straddling two.
+        let pencil = PaintDocument(width: 200, height: 200)
+        horizontalDrag(pencil, tool: .pencil, centerY: 100.5)
+        try expectInk(pencil, sampleColumn, 100, "pencil ink")
+        try expectPaintedWidth(
+            try verticalInkRun(pencil, column: sampleColumn),
+            .pencil,
+            "pencil band"
+        )
+
+        // Brush and Eraser are the same stroke in two colours: the declared
+        // widths must be identical, and so must the painted bands.
+        try expect(
+            PaintTool.brush.strokeWidth == PaintTool.eraser.strokeWidth,
+            "eraser strokeWidth is \(PaintTool.eraser.strokeWidth) but brush is "
+                + "\(PaintTool.brush.strokeWidth); the Eraser must match the Brush exactly"
+        )
+
+        let brush = PaintDocument(width: 200, height: 200)
+        horizontalDrag(brush, tool: .brush, centerY: 100)
+        let brushRun = try verticalInkRun(brush, column: sampleColumn)
+        try expectPaintedWidth(brushRun, .brush, "brush band")
+
+        // The Eraser paints the page colour, so it is measured as a cleared
+        // band cut through an inked canvas.
+        let eraser = PaintDocument(width: 200, height: 200)
+        eraser.floodFill(at: CGPoint(x: 0.5, y: 0.5), color: .black)
+        try expectInk(eraser, sampleColumn, 100, "inked canvas before erasing")
+        horizontalDrag(eraser, tool: .eraser, centerY: 100)
+        let eraserRun = try verticalClearRun(eraser, column: sampleColumn)
+        try expectPaintedWidth(eraserRun, .eraser, "eraser band")
+        try expectEqual(eraserRun, brushRun, "eraser band against the brush band")
+
+        // Shapes: one fine outline shared by the whole catalogue. Measured on
+        // the horizontal edges of a rectangle and on a horizontal line, both
+        // sampled away from any corner or cap.
+        let rectangle = PaintDocument(width: 200, height: 200)
+        rectangle.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 20, y: 40),
+            to: CGPoint(x: 180, y: 160),
+            color: .black,
+            constrained: false
+        )
+        try expectPaintedWidth(
+            try verticalInkRun(rectangle, column: 100),
+            .rectangle,
+            "rectangle edge"
+        )
+
+        let line = PaintDocument(width: 200, height: 200)
+        line.addShape(
+            tool: .line,
+            from: CGPoint(x: 20, y: 100),
+            to: CGPoint(x: 180, y: 100),
+            color: .black,
+            constrained: false
+        )
+        try expectPaintedWidth(try verticalInkRun(line, column: 100), .line, "line shape")
+    }
+
     private func cancelledStroke() throws {
         let document = PaintDocument(width: 32, height: 32)
-        dab(document, at: CGPoint(x: 16, y: 16), tool: .brush, lineWidth: 8)
+        dab(document, at: CGPoint(x: 16, y: 16), tool: .brush)
         try expectInk(document, 16, 16, "committed dab")
         try expectFlags(document, undo: true, redo: false, dirty: true)
 
@@ -588,8 +745,7 @@ final class ModelSmokeRun {
             to: CGPoint(x: 4, y: 4),
             tool: .brush,
             color: .black,
-            secondaryColor: .white,
-            lineWidth: 8
+            secondaryColor: .white
         )
         try expectInk(document, 4, 4, "in-flight ink before cancel")
 
@@ -624,14 +780,15 @@ final class ModelSmokeRun {
         let document = PaintDocument(width: 21, height: 21)
 
         // Solid one-pixel divider down column 10, splitting the canvas in two.
+        // Pencil is the one-pixel tool by construction, so the divider is one
+        // pixel wide without anyone asking for it.
         document.beginStroke()
         document.drawStroke(
             from: CGPoint(x: 10.5, y: 0),
             to: CGPoint(x: 10.5, y: 21),
             tool: .pencil,
             color: .black,
-            secondaryColor: .white,
-            lineWidth: 1
+            secondaryColor: .white
         )
         document.endStroke()
         try expectInk(document, 10, 0, "divider bottom")
@@ -660,7 +817,7 @@ final class ModelSmokeRun {
     private func colourPick() throws {
         let document = PaintDocument(width: 32, height: 32)
         let ink = NSColor(srgbRed: 0.2, green: 0.4, blue: 0.6, alpha: 1)
-        dab(document, at: CGPoint(x: 16, y: 16), tool: .brush, color: ink, lineWidth: 10)
+        dab(document, at: CGPoint(x: 16, y: 16), tool: .brush, color: ink)
 
         guard let picked = document.color(at: CGPoint(x: 16.5, y: 16.5))?
             .usingColorSpace(.sRGB)
@@ -731,12 +888,53 @@ final class ModelSmokeRun {
                 + describe(PaintTool.thickBrush.shortcut)
         )
 
+        // Width is embodied by the tool: every case must declare exactly the
+        // width the table above spells out, and the table must cover the enum,
+        // so a new tool cannot slip in without a deliberate width.
+        try expectEqual(
+            expectedStrokeWidths.count,
+            PaintTool.allCases.count,
+            "tools covered by the stroke-width table"
+        )
         for tool in PaintTool.allCases {
-            let expected = expectedMinimumStrokeWidths[tool] ?? 1
+            guard let expected = expectedStrokeWidths[tool] else {
+                throw SmokeFailure(
+                    scenario: scenario,
+                    message: "\(tool.rawValue) has no expected stroke width",
+                    file: #fileID,
+                    line: #line
+                )
+            }
             try expect(
-                tool.minimumStrokeWidth == expected,
-                "\(tool.rawValue) minimumStrokeWidth is \(tool.minimumStrokeWidth), "
-                    + "expected \(expected)"
+                tool.strokeWidth == expected,
+                "\(tool.rawValue) strokeWidth is \(tool.strokeWidth), expected \(expected)"
+            )
+            try expect(
+                tool.strokeWidth > 0,
+                "\(tool.rawValue) strokeWidth is \(tool.strokeWidth); every tool needs a real width"
+            )
+        }
+
+        // The relationships that make the widths meaningful, stated on their
+        // own so a table edited into agreement with a regression still fails.
+        try expect(
+            PaintTool.eraser.strokeWidth == PaintTool.brush.strokeWidth,
+            "eraser strokeWidth is \(PaintTool.eraser.strokeWidth), expected exactly the "
+                + "brush's \(PaintTool.brush.strokeWidth)"
+        )
+        try expect(
+            PaintTool.thickBrush.strokeWidth == PaintTool.brush.strokeWidth * 4,
+            "thickBrush strokeWidth is \(PaintTool.thickBrush.strokeWidth); the broad marker "
+                + "must dwarf the brush's \(PaintTool.brush.strokeWidth)"
+        )
+        try expect(
+            PaintTool.pencil.strokeWidth == 1,
+            "pencil strokeWidth is \(PaintTool.pencil.strokeWidth), expected a single pixel"
+        )
+        for tool in PaintTool.shapeTools {
+            try expect(
+                tool.strokeWidth == 4,
+                "\(tool.rawValue) strokeWidth is \(tool.strokeWidth); every shape outlines at 4pt"
             )
         }
 
@@ -1229,6 +1427,9 @@ final class ModelSmokeRun {
 
     /// Every shape reaches the bitmap as exactly one undoable checkpoint that a
     /// single undo removes completely and a single redo puts back.
+    ///
+    /// No call passes a width: `addShape` takes none, and the whole catalogue
+    /// outlines at the fixed 4pt every shape tool embodies.
     private func shapeRendering() throws {
         let start = CGPoint(x: 6, y: 5)
         let end = CGPoint(x: 54, y: 43)
@@ -1243,7 +1444,6 @@ final class ModelSmokeRun {
                 from: start,
                 to: end,
                 color: .black,
-                lineWidth: 3,
                 constrained: false
             )
 
@@ -1282,7 +1482,6 @@ final class ModelSmokeRun {
                 from: CGPoint(x: 4, y: 4),
                 to: CGPoint(x: 20, y: 20),
                 color: .black,
-                lineWidth: 3,
                 constrained: false
             )
             try expectEqual(document.revision, revision, "\(tool.rawValue): revision after addShape")
@@ -1298,7 +1497,6 @@ final class ModelSmokeRun {
                 from: CGPoint(x: 12, y: 12),
                 to: CGPoint(x: 12, y: 12),
                 color: .black,
-                lineWidth: 3,
                 constrained: false
             )
             try expectFlags(document, undo: false, redo: false, dirty: false)
@@ -1318,6 +1516,10 @@ final class ModelSmokeRun {
 
     private func describe(_ shortcut: Character?) -> String {
         shortcut.map { "\"\($0)\"" } ?? "nil"
+    }
+
+    private func describe(_ width: CGFloat?) -> String {
+        width.map { "\($0)" } ?? "nil"
     }
 
     private func requirePath(
