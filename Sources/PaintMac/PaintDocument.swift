@@ -528,6 +528,13 @@ final class PaintDocument: ObservableObject {
         entity(with: id)?.transform
     }
 
+    /// The colour an entity currently paints with, so a caller can tell a real
+    /// recolour from a no-op without reaching into the entity list. Nil for
+    /// unknown identifiers.
+    func entityColor(_ id: UUID) -> NSColor? {
+        entity(with: id)?.color
+    }
+
     /// World-space bounds the entity would occupy under `absolute` as its whole
     /// transform, ignoring the one it currently carries. This is the query for
     /// a candidate matrix a drag has already composed in full.
@@ -589,6 +596,27 @@ final class PaintDocument: ObservableObject {
 
         let snapshot = makeSnapshot()
         entities[index].transform = absolute
+        pushUndo(snapshot)
+        didMutate()
+        markMutated()
+    }
+
+    /// Repaints one entity as exactly one undoable step, leaving its geometry,
+    /// tool, text, transform and identity untouched.
+    ///
+    /// This is what choosing a colour with something selected means: the pick
+    /// lands on the selection instead of only arming the next stroke. Unknown
+    /// identifiers, entities the user cannot select in the first place — eraser
+    /// strokes — and a colour equivalent to the one already stored all change
+    /// nothing, so none of them leaves a history entry or dirties the document.
+    func recolorEntity(_ id: UUID, to color: NSColor) {
+        guard let index = entities.firstIndex(where: { $0.id == id }),
+              entities[index].isSelectable,
+              !PaintEntity.isSameColor(entities[index].color, color)
+        else { return }
+
+        let snapshot = makeSnapshot()
+        entities[index].replaceColor(color)
         pushUndo(snapshot)
         didMutate()
         markMutated()

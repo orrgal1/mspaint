@@ -402,6 +402,8 @@ final class ModelSmokeRun {
         try scenario("entity preview matches commit") { try entityPreviewMatchesCommit() }
         try scenario("entity delete") { try entityDelete() }
         try scenario("entity no-ops") { try entityNoOps() }
+        try scenario("entity recolour") { try entityRecolour() }
+        try scenario("entity recolour no-ops") { try entityRecolourNoOps() }
         try scenario("entity flattening") { try entityFlattening() }
         try scenario("entities in files") { try entitiesInFiles() }
         try scenario("resize and undo across dimensions") { try resizeAcrossDimensions() }
@@ -1776,6 +1778,17 @@ final class ModelSmokeRun {
     private let fixtureTextOrigin = CGPoint(x: 46, y: 44)
     private let fixtureText = "Ab"
     private let fixtureFontSize: CGFloat = 12
+
+    /// The colours a recolour is asked for, spelled out in sRGB so the pixels
+    /// they must produce can be derived here rather than read back out of the
+    /// model. Each is far from the black the fixture is drawn in and far from
+    /// the others, and each keeps one deeply dark channel, so a recolour that
+    /// lands the wrong colour — or on the wrong entity — cannot pass as
+    /// antialiasing.
+    private let recolourRed = NSColor(srgbRed: 0.85, green: 0.05, blue: 0.05, alpha: 1)
+    private let recolourBlue = NSColor(srgbRed: 0.05, green: 0.15, blue: 0.90, alpha: 1)
+    private let recolourGreen = NSColor(srgbRed: 0.05, green: 0.60, blue: 0.20, alpha: 1)
+    private let recolourViolet = NSColor(srgbRed: 0.70, green: 0.05, blue: 0.75, alpha: 1)
 
     /// Every committed drawing is one independently selectable entity, appended
     /// in z-order and checkpointed once. The eraser deliberately is not one.
@@ -3483,6 +3496,496 @@ final class ModelSmokeRun {
         )
     }
 
+    /// Recolouring an entity changes its colour and nothing else: the tool, the
+    /// geometry, the text, the matrix and the identifier it carries all survive,
+    /// the pixels it owns take the new colour, no pixel outside them moves, and
+    /// the whole change is exactly one undo step.
+    private func entityRecolour() throws {
+        let fixture = try entityFixture()
+        let document = fixture.document
+        let ids = fixture.ids
+        let glyphs = textSize(fixtureText, fixtureFontSize)
+
+        // One case per kind of content the model stores — a bounded shape, an
+        // open shape, a freehand stroke and text — each with a point that
+        // selects it, so a recolour that rebuilt the geometry instead of
+        // replacing the colour fails on the click as well as on the pixels.
+        let cases:
+            [(label: String, id: UUID, probe: CGPoint, tolerance: CGFloat, target: NSColor)] = [
+                ("rectangle", ids[0], CGPoint(x: 20, y: 8), 1, recolourRed),
+                ("line", ids[1], CGPoint(x: 58, y: 18), 1, recolourBlue),
+                ("doodle", ids[2], CGPoint(x: 18, y: 48), 2, recolourGreen),
+                (
+                    "text",
+                    ids[3],
+                    CGPoint(
+                        x: fixtureTextOrigin.x + glyphs.width / 2,
+                        y: fixtureTextOrigin.y + glyphs.height / 2
+                    ),
+                    0,
+                    recolourViolet
+                ),
+            ]
+
+        for item in cases {
+            let localBefore = try requireLocalBounds(document, item.id, "\(item.label): local box")
+            let worldBefore = try requireBounds(
+                document,
+                item.id,
+                .identity,
+                "\(item.label): ink box"
+            )
+            let matrixBefore = try requireTransform(document, item.id, "\(item.label): matrix")
+            let before = try raster(
+                try requireImage(document.cgImage, "\(item.label): the scene before the recolour")
+            )
+            let inked = try paintedPixels(before, in: worldBefore, .black)
+            let revision = document.revision
+
+            try expectEntityColor(
+                document,
+                item.id,
+                .black,
+                "\(item.label): the colour it was drawn with"
+            )
+            try expect(
+                inked >= 4,
+                "\(item.label): only \(inked) pixels carry the original colour"
+            )
+            try expectEqual(
+                try paintedPixels(before, in: worldBefore, item.target),
+                0,
+                "\(item.label): pixels already carrying the new colour"
+            )
+
+            document.recolorEntity(item.id, to: item.target)
+
+            // One visible change, one checkpoint.
+            try expect(
+                document.revision > revision,
+                "\(item.label): a recolour must bump revision"
+            )
+            try expectFlags(document, undo: true, redo: false, dirty: true)
+            try expectEntityColor(
+                document,
+                item.id,
+                item.target,
+                "\(item.label): the colour after the recolour"
+            )
+
+            // Identifier, z-order, geometry and matrix are untouched, which is
+            // what lets the colour be applied to a live selection without the
+            // frame around it moving.
+            try expect(
+                document.selectableEntityIDs == ids,
+                "\(item.label): a recolour must keep every identifier and the z-order"
+            )
+            let localAfter = try requireLocalBounds(
+                document,
+                item.id,
+                "\(item.label): local box after"
+            )
+            try expect(
+                nearlyEqual(localAfter, localBefore, 1e-9),
+                "\(item.label): the local box became \(localAfter), expected \(localBefore)"
+            )
+            let worldAfter = try requireBounds(
+                document,
+                item.id,
+                .identity,
+                "\(item.label): ink box after"
+            )
+            try expect(
+                nearlyEqual(worldAfter, worldBefore, 1e-9),
+                "\(item.label): the ink box became \(worldAfter), expected \(worldBefore)"
+            )
+            try expect(
+                document.entityTransform(item.id) == matrixBefore,
+                "\(item.label): a recolour must not touch the entity's matrix"
+            )
+            try expectEntity(
+                document,
+                at: item.probe,
+                tolerance: item.tolerance,
+                item.id,
+                "\(item.label) after the recolour"
+            )
+
+            // The ink it owns now carries the new colour, none of it still
+            // carries the old one, and nothing outside its own box moved.
+            let after = try raster(
+                try requireImage(document.cgImage, "\(item.label): the recoloured scene")
+            )
+            try expect(
+                try rasterDifference(before, after).differing > 0,
+                "\(item.label): a recolour must change the rendered pixels"
+            )
+            try expectEqual(
+                try rasterDifference(before, after, ignoring: worldBefore).differing,
+                0,
+                "\(item.label): pixels changed outside the recoloured entity's own box"
+            )
+            try expectEqual(
+                try paintedPixels(after, in: worldBefore, .black),
+                0,
+                "\(item.label): pixels still carrying the original colour"
+            )
+            let repainted = try paintedPixels(after, in: worldBefore, item.target)
+            try expect(
+                repainted >= inked - inked / 8,
+                "\(item.label): only \(repainted) of \(inked) inked pixels took the new colour"
+            )
+
+            // Exactly one step: one undo restores the scene the recolour
+            // replaced, pixel for pixel, and one redo puts it back.
+            document.undo()
+            try expectFlags(document, undo: true, redo: true, dirty: true)
+            try expectEntityColor(
+                document,
+                item.id,
+                .black,
+                "\(item.label): the colour one undo restores"
+            )
+            let undone = try raster(
+                try requireImage(document.cgImage, "\(item.label): the undone scene")
+            )
+            try expectEqual(
+                try rasterDifference(before, undone).differing,
+                0,
+                "\(item.label): pixels where one undo differs from the scene before the recolour"
+            )
+
+            document.redo()
+            try expectEntityColor(
+                document,
+                item.id,
+                item.target,
+                "\(item.label): the colour redo re-applies"
+            )
+            let redone = try raster(
+                try requireImage(document.cgImage, "\(item.label): the redone scene")
+            )
+            try expectEqual(
+                try rasterDifference(after, redone).differing,
+                0,
+                "\(item.label): pixels where redo differs from the recoloured scene"
+            )
+        }
+
+        // Recolouring all four back reproduces the bitmap the fixture drew in
+        // the first place, byte for byte — which nothing that rebuilt geometry
+        // could manage: a re-snapped shape, a re-measured text box or a stroke
+        // laid down at another tool's width would all leave a trace here.
+        let painted = try raster(try requireImage(document.cgImage, "the recoloured scene"))
+        for item in cases {
+            document.recolorEntity(item.id, to: .black)
+        }
+        let blackAgain = try raster(
+            try requireImage(document.cgImage, "the scene painted black again")
+        )
+        try expect(
+            try rasterDifference(painted, blackAgain).differing > 0,
+            "recolouring back to black must change the pixels again"
+        )
+        let pristine = try raster(
+            try requireImage(try entityFixture().document.cgImage, "a freshly drawn fixture")
+        )
+        try expectEqual(
+            try rasterDifference(blackAgain, pristine).differing,
+            0,
+            "pixels where recolouring back to black differs from the fixture as first drawn"
+        )
+
+        // A recolour applied to an entity that has already been dragged and
+        // turned keeps the matrix it accumulated, so the colour lands on the
+        // shape where the user left it instead of snapping it back.
+        let turned = try entityFixture()
+        let turnedID = turned.ids[0]
+        let box = try requireBounds(turned.document, turnedID, .identity, "the rectangle's box")
+        turned.document.transformEntity(
+            turnedID,
+            by: PaintEntity.rotationTransform(
+                by: 0.5,
+                around: CGPoint(x: box.midX, y: box.midY)
+            )
+        )
+        turned.document.transformEntity(turnedID, by: PaintEntity.moveTransform(dx: 6, dy: -4))
+        let turnedMatrix = try requireTransform(
+            turned.document,
+            turnedID,
+            "the accumulated matrix"
+        )
+        let turnedBox = try requireBounds(turned.document, turnedID, .identity, "the turned box")
+        let turnedBefore = try raster(
+            try requireImage(turned.document.cgImage, "the turned scene")
+        )
+
+        turned.document.recolorEntity(turnedID, to: recolourRed)
+        try expect(
+            turned.document.entityTransform(turnedID) == turnedMatrix,
+            "a recolour must leave an accumulated matrix exactly as it was"
+        )
+        let turnedAfter = try raster(
+            try requireImage(turned.document.cgImage, "the turned, recoloured scene")
+        )
+        try expectEqual(
+            try rasterDifference(turnedBefore, turnedAfter, ignoring: turnedBox).differing,
+            0,
+            "a recoloured entity must repaint only where its turned ink already was"
+        )
+        let turnedInk = try paintedPixels(turnedAfter, in: turnedBox, recolourRed)
+        try expect(
+            turnedInk >= 4,
+            "only \(turnedInk) pixels of the turned entity took the new colour"
+        )
+
+        // The colour is content, not a rendering: a later transform carries it
+        // along instead of reverting it.
+        turned.document.transformEntity(turnedID, by: PaintEntity.moveTransform(dx: -3, dy: 5))
+        try expectEntityColor(
+            turned.document,
+            turnedID,
+            recolourRed,
+            "the colour after a later move"
+        )
+
+        // `entityColor` reports whatever the entity was drawn with, which is
+        // what makes it usable as the colour a selection reports back.
+        let drawnInColour = PaintDocument(width: 40, height: 40)
+        doodle(
+            drawnInColour,
+            [CGPoint(x: 6.5, y: 6.5), CGPoint(x: 30.5, y: 30.5)],
+            color: recolourGreen
+        )
+        drawnInColour.addText("Hi", at: CGPoint(x: 4, y: 20), color: recolourViolet, fontSize: 10)
+        let drawnIDs = drawnInColour.selectableEntityIDs
+        try expectEqual(drawnIDs.count, 2, "entities drawn in their own colours")
+        try expectEntityColor(drawnInColour, drawnIDs[0], recolourGreen, "the stroke's own colour")
+        try expectEntityColor(drawnInColour, drawnIDs[1], recolourViolet, "the text's own colour")
+    }
+
+    /// Recolour requests that cannot change anything change neither the
+    /// colours, the pixels nor the history: a colour the entity already
+    /// carries — however it is spelled — an unknown identifier, and the one
+    /// entity the model never makes selectable, the eraser stroke.
+    private func entityRecolourNoOps() throws {
+        let fixture = try entityFixture()
+        let document = fixture.document
+        let ids = fixture.ids
+        let id = ids[0]
+        let before = try raster(try requireImage(document.cgImage, "the fixture scene"))
+        let revision = document.revision
+
+        // Spelling black differently is not changing it: each of these is the
+        // colour the entity already carries once both sides are taken to the
+        // 8-bit sRGB the bitmap stores.
+        let equivalents: [(label: String, color: NSColor)] = [
+            ("the same colour object", .black),
+            ("sRGB zero", NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)),
+            ("device grey zero", NSColor(deviceWhite: 0, alpha: 1)),
+            ("calibrated grey zero", NSColor(calibratedWhite: 0, alpha: 1)),
+        ]
+        for attempt in equivalents {
+            document.recolorEntity(id, to: attempt.color)
+            try expectEqual(
+                document.revision,
+                revision,
+                "revision after recolouring to \(attempt.label)"
+            )
+            try expectFlags(document, undo: true, redo: false, dirty: true)
+            try expectEntityColor(
+                document,
+                id,
+                .black,
+                "the colour after recolouring to \(attempt.label)"
+            )
+            let unchanged = try raster(
+                try requireImage(document.cgImage, "the scene after \(attempt.label)")
+            )
+            try expectEqual(
+                try rasterDifference(before, unchanged).differing,
+                0,
+                "pixels changed by recolouring to \(attempt.label)"
+            )
+        }
+
+        // Unknown identifiers are not errors, they are nothing.
+        let stranger = UUID()
+        try expect(document.entityColor(stranger) == nil, "an unknown identifier has no colour")
+        document.recolorEntity(stranger, to: recolourRed)
+        try expectEqual(
+            document.revision,
+            revision,
+            "revision after recolouring an unknown identifier"
+        )
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expect(
+            document.selectableEntityIDs == ids,
+            "an unknown identifier must change no entity"
+        )
+        let untouched = try raster(
+            try requireImage(document.cgImage, "the scene after the unknown identifier")
+        )
+        try expectEqual(
+            try rasterDifference(before, untouched).differing,
+            0,
+            "pixels changed by recolouring an unknown identifier"
+        )
+
+        // A real recolour, and then the same rejections measured against the
+        // colour the entity carries *now* — including one that differs only
+        // below the precision the bitmap can hold.
+        document.recolorEntity(id, to: recolourRed)
+        let recoloured = document.revision
+        try expect(recoloured > revision, "a real recolour must bump revision")
+        let painted = try raster(try requireImage(document.cgImage, "the recoloured scene"))
+
+        let alreadyRed: [(label: String, color: NSColor)] = [
+            ("the colour it was just given", recolourRed),
+            ("an identical sRGB colour", NSColor(srgbRed: 0.85, green: 0.05, blue: 0.05, alpha: 1)),
+            (
+                "a colour differing below 8-bit precision",
+                NSColor(srgbRed: 0.8505, green: 0.0505, blue: 0.0505, alpha: 1)
+            ),
+        ]
+        for attempt in alreadyRed {
+            document.recolorEntity(id, to: attempt.color)
+            try expectEqual(
+                document.revision,
+                recoloured,
+                "revision after recolouring to \(attempt.label)"
+            )
+            let unchanged = try raster(
+                try requireImage(document.cgImage, "the scene after \(attempt.label)")
+            )
+            try expectEqual(
+                try rasterDifference(painted, unchanged).differing,
+                0,
+                "pixels changed by recolouring to \(attempt.label)"
+            )
+        }
+
+        // One real recolour is one step, and none of the rejections left a
+        // half-open edit behind: one undo lands exactly on the scene before it.
+        document.undo()
+        try expectEntityColor(document, id, .black, "the colour one undo restores")
+        let undone = try raster(try requireImage(document.cgImage, "the undone scene"))
+        try expectEqual(
+            try rasterDifference(before, undone).differing,
+            0,
+            "pixels where undoing one recolour differs from the scene before it"
+        )
+        document.redo()
+        try expectEntityColor(document, id, recolourRed, "the colour redo re-applies")
+
+        // A chain of real recolours is a chain of steps; the no-op wedged
+        // between them is not one of them.
+        document.recolorEntity(id, to: recolourBlue)
+        document.recolorEntity(id, to: recolourBlue)
+        document.recolorEntity(id, to: recolourGreen)
+        document.undo()
+        try expectEntityColor(document, id, recolourBlue, "the colour one undo steps back to")
+        document.undo()
+        try expectEntityColor(document, id, recolourRed, "the colour two undos step back to")
+        document.undo()
+        try expectEntityColor(document, id, .black, "the colour three undos step back to")
+
+        // Four fixture checkpoints and nothing else on the stack.
+        try expectFlags(document, undo: true, redo: true, dirty: true)
+        for _ in 0..<4 {
+            document.undo()
+        }
+        try expect(
+            document.selectableEntityIDs.isEmpty,
+            "unwinding every checkpoint must remove every entity"
+        )
+        try expectFlags(document, undo: false, redo: true, dirty: false)
+
+        // The eraser is the one entity a recolour can never reach: it paints
+        // the page colour rather than adding content, so the model withholds
+        // its identifier from both `selectableEntityIDs` and
+        // `entityID(at:tolerance:)`. Recolouring every identifier the model
+        // does hand out therefore leaves the erased band exactly as white as
+        // the eraser left it, and costs one checkpoint rather than two.
+        let erased = PaintDocument(width: entityCanvas.width, height: entityCanvas.height)
+        erased.addShape(
+            tool: .rectangle,
+            from: fixtureRect.from,
+            to: fixtureRect.to,
+            color: .black,
+            constrained: false
+        )
+        let erasedIDs = erased.selectableEntityIDs
+        try expectEqual(erasedIDs.count, 1, "one entity before the eraser stroke")
+        try expectInk(erased, 20, 8, "the outline before the eraser stroke")
+
+        doodle(erased, [CGPoint(x: 14, y: 8), CGPoint(x: 44, y: 8)], tool: .eraser)
+        try expect(
+            erased.selectableEntityIDs == erasedIDs,
+            "an eraser stroke must stay unlisted, so no recolour can address it"
+        )
+        try expectNoEntity(
+            erased,
+            at: CGPoint(x: 40, y: 8),
+            tolerance: 1,
+            "pixels only the eraser painted"
+        )
+        try expect(try isPage(erased, 20, 8), "the eraser cleared the outline")
+
+        let erasedRevision = erased.revision
+        for target in erased.selectableEntityIDs {
+            erased.recolorEntity(target, to: recolourRed)
+        }
+        try expect(
+            erased.revision > erasedRevision,
+            "recolouring the entity the model does list must bump revision"
+        )
+        try expect(
+            try isPage(erased, 20, 8),
+            "the erased band must stay the page colour when the entity under it is recoloured"
+        )
+        let outlineBox = try requireBounds(erased, erasedIDs[0], .identity, "the outline's box")
+        let erasedInk = try paintedPixels(
+            try raster(try requireImage(erased.cgImage, "the recoloured, erased scene")),
+            in: outlineBox,
+            recolourRed
+        )
+        try expect(
+            erasedInk >= 4,
+            "only \(erasedInk) pixels of the surviving outline took the new colour"
+        )
+
+        // Three checkpoints in all — outline, eraser stroke, recolour — so the
+        // recolour of the listed entity really was the only one recorded.
+        erased.undo()
+        try expectEntityColor(erased, erasedIDs[0], .black, "the colour one undo restores")
+        try expect(try isPage(erased, 20, 8), "the erased band survives the undo")
+        erased.undo()
+        erased.undo()
+        try expect(
+            erased.selectableEntityIDs.isEmpty,
+            "two more undos must unwind the eraser stroke and the outline"
+        )
+        try expectFlags(erased, undo: false, redo: true, dirty: false)
+
+        // The guard the document applies is the entity's own, and replacing a
+        // colour does not soften it: an eraser stroke stays unselectable, so
+        // no recolour of anything the model lists can ever reach one.
+        var eraserStroke = PaintEntity(
+            content: .stroke(
+                tool: .eraser,
+                points: [CGPoint(x: 4, y: 4), CGPoint(x: 20, y: 4)],
+                color: .white
+            )
+        )
+        try expect(!eraserStroke.isSelectable, "an eraser stroke must not be selectable")
+        eraserStroke.replaceColor(recolourRed)
+        try expect(
+            !eraserStroke.isSelectable,
+            "replacing an eraser stroke's colour must not make it selectable"
+        )
+    }
+
     /// Flood fill, clear and a new document flatten or drop the entities; the
     /// pixels they were made of survive where they should, and resizing keeps
     /// the entities anchored exactly like the background.
@@ -4147,6 +4650,98 @@ final class ModelSmokeRun {
             Double(srgb.blueComponent),
             Double(srgb.alphaComponent)
         )
+    }
+
+    /// Asserts the colour the document reports for an entity, compared exactly
+    /// as the model compares colours: at the 8-bit sRGB depth the bitmap keeps,
+    /// so a colour spelled in another space still counts as the same one.
+    private func expectEntityColor(
+        _ document: PaintDocument,
+        _ id: UUID,
+        _ expected: NSColor,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws {
+        guard let actual = document.entityColor(id) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "\(label): entityColor returned nil",
+                file: file,
+                line: line
+            )
+        }
+        let got = format(try srgbComponents(actual, file: file, line: line))
+        let want = format(try srgbComponents(expected, file: file, line: line))
+        try expect(
+            PaintEntity.isSameColor(actual, expected),
+            "\(label): got \(got), expected \(want)",
+            file: file,
+            line: line
+        )
+    }
+
+    /// The coverage at which `color` laid over the page would produce `sample`,
+    /// or nil when the pixel is not on that line at all.
+    ///
+    /// A single-coloured entity can only ever deposit colours between page
+    /// white and its own, so this is the exact test for "this pixel is ink
+    /// belonging to something painted `color`" — one an antialiased outline, a
+    /// hairline pencil dab and a glyph edge all pass at their own coverage, and
+    /// one a differently coloured entity fails at every coverage. The colour
+    /// asked about must darken at least one channel appreciably, or there is no
+    /// signal to measure coverage from.
+    private func whiteBlend(_ sample: Pixel, _ color: Pixel, slack: Double) -> Double? {
+        guard sample.a >= 0.99 else { return nil }
+        let depth = max(1 - color.r, max(1 - color.g, 1 - color.b))
+        guard depth > 0.2 else { return nil }
+        let measured: Double
+        if 1 - color.r == depth {
+            measured = 1 - sample.r
+        } else if 1 - color.g == depth {
+            measured = 1 - sample.g
+        } else {
+            measured = 1 - sample.b
+        }
+        let coverage = measured / depth
+        guard coverage >= -slack, coverage <= 1 + slack else { return nil }
+        let onTheLine = abs(sample.r - (1 - coverage * (1 - color.r))) <= slack
+            && abs(sample.g - (1 - coverage * (1 - color.g))) <= slack
+            && abs(sample.b - (1 - coverage * (1 - color.b))) <= slack
+        return onTheLine ? min(1, max(0, coverage)) : nil
+    }
+
+    /// How many pixels inside a document-space rectangle are `color` laid over
+    /// the page at `minimumCoverage` or better: the ink one colour contributes,
+    /// counted without having to predict where any single antialiased pixel
+    /// lands. The floor keeps a faint fringe — which sits on every colour's
+    /// line near zero coverage — from counting as ink.
+    private func paintedPixels(
+        _ raster: Raster,
+        in rect: CGRect,
+        _ color: NSColor,
+        minimumCoverage: Double = 0.25,
+        slack: Double = 4.0 / 255.0,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> Int {
+        let want = try srgbComponents(color, file: file, line: line)
+        let box = rect.integral.intersection(
+            CGRect(x: 0, y: 0, width: raster.width, height: raster.height)
+        )
+        guard !box.isNull, !box.isEmpty else { return 0 }
+        var count = 0
+        for y in Int(box.minY)..<Int(box.maxY) {
+            // Raster rows count down from the top; document pixels count up.
+            let row = raster.height - 1 - y
+            for x in Int(box.minX)..<Int(box.maxX) {
+                guard let coverage = whiteBlend(raster.pixel(x, row), want, slack: slack) else {
+                    continue
+                }
+                if coverage >= minimumCoverage { count += 1 }
+            }
+        }
+        return count
     }
 
     // MARK: Shape helpers

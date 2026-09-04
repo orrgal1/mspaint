@@ -15,6 +15,10 @@ final class PaintSession: ObservableObject {
     @Published var secondaryColor: Color = .white
     @Published var zoom: Double = 1
     @Published var cursorPosition: CGPoint?
+    /// The entity the canvas has selected, mirrored here so a Color 1 choice knows
+    /// what to repaint. The canvas is the only writer: it reports every transition,
+    /// including the ones a stale or deleted entity forces.
+    @Published var selectedEntityID: UUID?
     @Published var isPresentingResize = false
     @Published private(set) var fileURL: URL?
 
@@ -35,10 +39,21 @@ final class PaintSession: ObservableObject {
         document.isDirty ? "\(documentName) — Edited" : documentName
     }
 
-    // MARK: Tools, zoom
+    // MARK: Tools, colors, zoom
 
     func select(_ tool: PaintTool) {
         self.tool = tool
+    }
+
+    /// The one route for every explicit Color 1 choice — palette swatch, colour
+    /// well, context menu, eyedropper. The colour becomes the active one for future
+    /// drawing and, when an entity is selected, that entity is repainted in it as a
+    /// single undoable step. Color 2 and Swap Colors are plain state writes: neither
+    /// is a statement about the selected entity.
+    func setPrimaryColor(_ color: Color) {
+        primaryColor = color
+        guard let id = selectedEntityID else { return }
+        document.recolorEntity(id, to: NSColor(color))
     }
 
     func zoomIn() { setZoom(zoom + 0.25) }
@@ -262,6 +277,9 @@ private struct PaintCommands: Commands {
             Button("Actual Size") { session.resetZoom() }
                 .keyboardShortcut("0", modifiers: .command)
             Divider()
+            // Swapping is bookkeeping between the two wells, not a choice of a
+            // colour for the selected entity, so it writes the state directly
+            // rather than going through `setPrimaryColor`.
             Button("Swap Colors") {
                 let primary = session.primaryColor
                 session.primaryColor = session.secondaryColor

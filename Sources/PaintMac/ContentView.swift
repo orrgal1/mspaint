@@ -319,7 +319,7 @@ private struct ColorsControl: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            colorWell(label: "Color 1", selection: $session.primaryColor)
+            colorWell(label: "Color 1", selection: primaryColorSelection)
             colorWell(label: "Color 2", selection: $session.secondaryColor)
             LazyVGrid(
                 columns: Array(repeating: GridItem(.fixed(16), spacing: 3), count: 10),
@@ -331,6 +331,16 @@ private struct ColorsControl: View {
             }
             .frame(width: 187)
         }
+    }
+
+    /// The well writes Color 1 the same way every other chooser does, so picking a
+    /// colour there repaints the selected entity instead of only arming the next
+    /// stroke.
+    private var primaryColorSelection: Binding<Color> {
+        Binding(
+            get: { session.primaryColor },
+            set: { session.setPrimaryColor($0) }
+        )
     }
 
     private func colorWell(label: String, selection: Binding<Color>) -> some View {
@@ -357,12 +367,12 @@ private struct SwatchButton: View {
             )
             .frame(width: 16, height: 16)
             .contentShape(Rectangle())
-            .onTapGesture { session.primaryColor = color }
+            .onTapGesture { session.setPrimaryColor(color) }
             .highPriorityGesture(
                 TapGesture().modifiers(.option).onEnded { session.secondaryColor = color }
             )
             .contextMenu {
-                Button("Set as Color 1") { session.primaryColor = color }
+                Button("Set as Color 1") { session.setPrimaryColor(color) }
                 Button("Set as Color 2") { session.secondaryColor = color }
             }
             .help("Click to set Color 1, ⌥-click to set Color 2")
@@ -391,21 +401,14 @@ private struct CanvasWorkspace: View {
     }
 
     private var canvas: some View {
-        PaintCanvasRepresentable(
-            document: document,
-            tool: $session.tool,
-            primaryColor: $session.primaryColor,
-            secondaryColor: $session.secondaryColor,
-            zoom: $session.zoom,
-            cursorPosition: $session.cursorPosition
-        )
-        .frame(
-            width: max(document.canvasSize.width * session.zoom, 1),
-            height: max(document.canvasSize.height * session.zoom, 1)
-        )
-        .background(Color.white)
-        .overlay(Rectangle().strokeBorder(Color.secondary.opacity(0.45), lineWidth: 1))
-        .shadow(color: .black.opacity(0.22), radius: 6, x: 0, y: 2)
+        PaintCanvasRepresentable(session: session, document: document)
+            .frame(
+                width: max(document.canvasSize.width * session.zoom, 1),
+                height: max(document.canvasSize.height * session.zoom, 1)
+            )
+            .background(Color.white)
+            .overlay(Rectangle().strokeBorder(Color.secondary.opacity(0.45), lineWidth: 1))
+            .shadow(color: .black.opacity(0.22), radius: 6, x: 0, y: 2)
     }
 }
 

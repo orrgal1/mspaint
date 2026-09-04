@@ -57,6 +57,27 @@ struct PaintEntity: Identifiable {
         transform = transform.concatenating(additional)
     }
 
+    /// Repaints the entity, leaving everything else exactly as it was.
+    ///
+    /// Only the colour payload of the current content is swapped: the stroke
+    /// keeps its tool and its points, the shape its endpoints, the text its
+    /// string, origin and font size, and the entity keeps its identifier and
+    /// its accumulated transform. Recolouring is therefore invisible to
+    /// selection, hit testing and bounds, which is what lets it be applied to
+    /// a live selection without disturbing the frame around it.
+    mutating func replaceColor(_ color: NSColor) {
+        switch content {
+        case let .stroke(tool, points, _):
+            // `points` is copy-on-write and is only rebound here, never
+            // mutated, so the stroke's buffer is shared rather than copied.
+            content = .stroke(tool: tool, points: points, color: color)
+        case let .shape(tool, from, to, _):
+            content = .shape(tool: tool, from: from, to: to, color: color)
+        case let .text(value, origin, _, fontSize):
+            content = .text(value: value, origin: origin, color: color, fontSize: fontSize)
+        }
+    }
+
     /// Eraser strokes paint the background colour rather than adding content, so
     /// they are deliberately not selectable; everything else is.
     var isSelectable: Bool {
@@ -400,6 +421,35 @@ struct PaintEntity: Identifiable {
 
     private static func cgColor(_ color: NSColor) -> CGColor {
         (color.usingColorSpace(.sRGB) ?? color).cgColor
+    }
+
+    /// True when two colours would deposit the same ink.
+    ///
+    /// Colours reach the app from the palette, the colour panel and the
+    /// eyedropper in whatever space AppKit handed them over in, so the same
+    /// red can arrive calibrated from one control and sRGB from the next and
+    /// still be one colour to the user. Both sides are pushed through the very
+    /// conversion the renderer uses and compared at the 8-bit depth the
+    /// document bitmap stores, which is the precision a difference would have
+    /// to survive to be visible at all.
+    static func isSameColor(_ lhs: NSColor, _ rhs: NSColor) -> Bool {
+        channels(of: lhs) == channels(of: rhs)
+    }
+
+    /// Straight (non-premultiplied) 8-bit sRGB channels. Colours with no
+    /// component representation — patterns — collapse to the same fallback the
+    /// bitmap writer uses, so they compare equal to each other and to black.
+    private static func channels(of color: NSColor) -> (UInt8, UInt8, UInt8, UInt8) {
+        let srgb = color.usingColorSpace(.sRGB) ?? NSColor.black
+        let scale: (CGFloat) -> UInt8 = { value in
+            UInt8(max(0, min(255, (value * 255).rounded())))
+        }
+        return (
+            scale(srgb.redComponent),
+            scale(srgb.greenComponent),
+            scale(srgb.blueComponent),
+            scale(srgb.alphaComponent)
+        )
     }
 
     /// Below this the matrix has no usable inverse and the entity has no area.

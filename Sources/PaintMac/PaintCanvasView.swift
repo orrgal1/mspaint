@@ -55,7 +55,8 @@ final class PaintCanvasView: NSView {
     /// The selected entity: its identity, the tight bounds of its own untransformed
     /// geometry, the absolute matrix that places that geometry in the document, and
     /// the revision both were read at. Any edit the selection did not make bumps the
-    /// revision and makes the selection stale.
+    /// revision, which is the cue to re-read the frame from the entity or to let the
+    /// selection go when the entity is no longer there.
     ///
     /// Local bounds plus a matrix, rather than a world-space box, is the whole point:
     /// the box around a rotated entity is bigger than the entity, so re-reading it
@@ -91,6 +92,14 @@ final class PaintCanvasView: NSView {
     private var sceneImageEntity: UUID?
     /// True while the closed-hand cursor is pushed for a move drag.
     private var pushedMoveCursor = false
+    /// The identity the selection callback last handed out, so a report is emitted
+    /// once per real transition rather than once per assignment: re-reading the same
+    /// entity's committed transform after a drag is not a selection change.
+    private var reportedSelection: UUID?
+    /// True only while `apply` runs, which is inside a SwiftUI view update. A report
+    /// raised there publishes SwiftUI state, which an update may not do, so it is
+    /// handed over on the next pass of the run loop instead.
+    private var isApplyingState = false
 
     // MARK: Configuration
 
@@ -107,6 +116,8 @@ final class PaintCanvasView: NSView {
     var onPickColor: ((NSColor, Bool) -> Void)?
     /// Requests a tool change from a bare-key shortcut handled by this view.
     var onSelectTool: ((PaintTool) -> Void)?
+    /// Reports the selected entity, or `nil` whenever nothing is selected.
+    var onSelectionChange: ((UUID?) -> Void)?
 
     init(document: PaintDocument) {
         self.document = document
@@ -129,6 +140,9 @@ final class PaintCanvasView: NSView {
         secondaryColor newSecondary: NSColor,
         zoom newZoom: CGFloat
     ) {
+        isApplyingState = true
+        defer { isApplyingState = false }
+
         if newDocument !== document {
             cancelGesture()
             clearSelection()
@@ -170,7 +184,7 @@ final class PaintCanvasView: NSView {
                 self.syncSize()
                 if self.document.revision != self.observedRevision {
                     self.observedRevision = self.document.revision
-                    self.discardStaleSelection()
+                    self.refreshSelectionAfterExternalEdit()
                     self.needsDisplay = true
                 }
             }
@@ -812,6 +826,7 @@ final class PaintCanvasView: NSView {
         candidateTransform = nil
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
+        reportSelection()
         return true
     }
 
@@ -886,17 +901,47 @@ final class PaintCanvasView: NSView {
         invalidateSceneImage()
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
+        reportSelection()
     }
 
-    /// Any edit the selection did not make — undo, redo, another tool, a canvas
-    /// resize — can move or remove the entity underneath it, so the selection is
-    /// dropped rather than left describing a document that no longer exists.
-    private func discardStaleSelection() {
+    /// Hands the selected identity to `onSelectionChange`, once per transition.
+    ///
+    /// A report raised from `apply` is deferred, because the observer publishes
+    /// SwiftUI state and a view update may not. The deferred pass re-reads the
+    /// selection instead of replaying a captured identity, so a late delivery still
+    /// describes the selection as it actually stands.
+    private func reportSelection() {
+        guard !isApplyingState else {
+            DispatchQueue.main.async { [weak self] in self?.deliverSelection() }
+            return
+        }
+        deliverSelection()
+    }
+
+    private func deliverSelection() {
+        let id = selection?.id
+        guard id != reportedSelection else { return }
+        reportedSelection = id
+        onSelectionChange?(id)
+    }
+
+    /// Any edit the selection did not make — undo, redo, a canvas resize, a recolor
+    /// driven from the colour wells — bumps the revision under the selection, so the
+    /// frame is re-read from the entity itself: its own local bounds and its own
+    /// matrix, which is what an external transform change has to be picked up from
+    /// and what a repaint leaves untouched. Re-reading the entity's *local* frame is
+    /// safe where re-measuring a world box would inflate it.
+    ///
+    /// Only an entity that is gone, or one that no longer draws anything, drops the
+    /// selection: `select` fails exactly then. Selectability cannot change under an
+    /// identity — an entity's tool and geometry are fixed at creation and a recolor
+    /// keeps both — so an entity the pick let through stays pickable.
+    private func refreshSelectionAfterExternalEdit() {
         guard let current = selection, current.revision != document.revision else { return }
         if case .entity = gesture {
             cancelGesture()
         }
-        clearSelection()
+        select(current.id)
     }
 
     /// Delete and Backspace remove the selected entity in one undoable step and
@@ -1408,12 +1453,11 @@ final class PaintCanvasView: NSView {
 // MARK: - SwiftUI bridge
 
 struct PaintCanvasRepresentable: NSViewRepresentable {
+    /// The canvas talks to the session rather than to loose bindings, because a
+    /// sampled or chosen Color 1 is not a plain state write: it goes through
+    /// `PaintSession.setPrimaryColor`, which also repaints the selected entity.
+    @ObservedObject var session: PaintSession
     @ObservedObject var document: PaintDocument
-    @Binding var tool: PaintTool
-    @Binding var primaryColor: Color
-    @Binding var secondaryColor: Color
-    @Binding var zoom: Double
-    @Binding var cursorPosition: CGPoint?
 
     func makeNSView(context: Context) -> PaintCanvasView {
         let view = PaintCanvasView(document: document)
@@ -1425,36 +1469,40 @@ struct PaintCanvasRepresentable: NSViewRepresentable {
         install(on: view)
         view.apply(
             document: document,
-            tool: tool,
-            primaryColor: NSColor(primaryColor),
-            secondaryColor: NSColor(secondaryColor),
-            zoom: CGFloat(zoom)
+            tool: session.tool,
+            primaryColor: NSColor(session.primaryColor),
+            secondaryColor: NSColor(session.secondaryColor),
+            zoom: CGFloat(session.zoom)
         )
     }
 
     private func install(on view: PaintCanvasView) {
-        let cursorBinding = $cursorPosition
+        let session = self.session
+
         view.onCursorChange = { point in
-            if cursorBinding.wrappedValue != point {
-                cursorBinding.wrappedValue = point
+            if session.cursorPosition != point {
+                session.cursorPosition = point
             }
         }
 
-        let primaryBinding = $primaryColor
-        let secondaryBinding = $secondaryColor
         view.onPickColor = { sampled, isSecondary in
             let picked = Color(nsColor: sampled)
             if isSecondary {
-                secondaryBinding.wrappedValue = picked
+                session.secondaryColor = picked
             } else {
-                primaryBinding.wrappedValue = picked
+                session.setPrimaryColor(picked)
             }
         }
 
-        let toolBinding = $tool
         view.onSelectTool = { selected in
-            if toolBinding.wrappedValue != selected {
-                toolBinding.wrappedValue = selected
+            if session.tool != selected {
+                session.tool = selected
+            }
+        }
+
+        view.onSelectionChange = { id in
+            if session.selectedEntityID != id {
+                session.selectedEntityID = id
             }
         }
     }
