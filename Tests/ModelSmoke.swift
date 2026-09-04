@@ -1,10 +1,12 @@
 // Framework-free behavioural smoke test for the Paint document model.
 //
 // This toolchain (Apple CommandLineTools, no Xcode) ships neither XCTest nor
-// Swift Testing, so the model is verified by compiling `PaintTypes.swift` and
-// `PaintDocument.swift` together with this file into one throwaway executable.
-// See `test-model.sh`. Every check asserts observable bitmap, history, dirty or
-// file behaviour; the process exits non-zero on the first failed expectation.
+// Swift Testing, so the model is verified by compiling `PaintTypes.swift`,
+// `PaintShapeGeometry.swift`, `PaintEntity.swift` and `PaintDocument.swift`
+// together with this file into one throwaway executable.
+// See `test-model.sh`. Every check asserts observable bitmap, entity, history,
+// dirty or file behaviour; the process exits non-zero on the first failed
+// expectation.
 
 import AppKit
 import CoreGraphics
@@ -228,6 +230,143 @@ private func nearlyEqual(_ lhs: CGRect, _ rhs: CGRect, _ epsilon: CGFloat) -> Bo
         && nearlyEqual(lhs.height, rhs.height, epsilon)
 }
 
+// MARK: - Oriented selection frame geometry
+
+/// The quadrilateral an oriented selection frame draws: the four corners of a
+/// *local* rectangle pushed through the entity's matrix, in the rectangle's own
+/// order — bottom-left, bottom-right, top-right, top-left.
+///
+/// Every frame expectation below is phrased against this rather than against an
+/// axis-aligned box, because an axis-aligned box is precisely what a rotated
+/// frame must not degrade into.
+private func frameCorners(_ rect: CGRect, _ transform: CGAffineTransform) -> [CGPoint] {
+    [
+        CGPoint(x: rect.minX, y: rect.minY),
+        CGPoint(x: rect.maxX, y: rect.minY),
+        CGPoint(x: rect.maxX, y: rect.maxY),
+        CGPoint(x: rect.minX, y: rect.maxY),
+    ].map { $0.applying(transform) }
+}
+
+/// |cos| of the angle between the two frame edges meeting at the first corner:
+/// zero while the frame's own axes are still perpendicular, and the direct
+/// measure of shear once they are not.
+private func frameShear(_ corners: [CGPoint]) -> CGFloat {
+    guard corners.count == 4 else { return 1 }
+    let ux = corners[1].x - corners[0].x
+    let uy = corners[1].y - corners[0].y
+    let vx = corners[3].x - corners[0].x
+    let vy = corners[3].y - corners[0].y
+    let lengths = hypot(ux, uy) * hypot(vx, vy)
+    guard lengths > 0 else { return 1 }
+    return abs(ux * vx + uy * vy) / lengths
+}
+
+/// World length of the frame's local x axis.
+private func frameWidth(_ corners: [CGPoint]) -> CGFloat {
+    hypot(corners[1].x - corners[0].x, corners[1].y - corners[0].y)
+}
+
+/// World length of the frame's local y axis.
+private func frameHeight(_ corners: [CGPoint]) -> CGFloat {
+    hypot(corners[3].x - corners[0].x, corners[3].y - corners[0].y)
+}
+
+/// Direction of the frame's local x axis, in radians.
+private func frameAngle(_ corners: [CGPoint]) -> CGFloat {
+    atan2(corners[1].y - corners[0].y, corners[1].x - corners[0].x)
+}
+
+/// Axis-aligned hull of a frame: what a world-space measurement collapses the
+/// frame to, and the yardstick the tightness checks are compared against.
+private func frameHull(_ corners: [CGPoint]) -> CGRect {
+    guard let first = corners.first else { return .null }
+    var minX = first.x
+    var maxX = first.x
+    var minY = first.y
+    var maxY = first.y
+    for corner in corners.dropFirst() {
+        minX = min(minX, corner.x)
+        maxX = max(maxX, corner.x)
+        minY = min(minY, corner.y)
+        maxY = max(maxY, corner.y)
+    }
+    return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+}
+
+private func frameArea(_ corners: [CGPoint]) -> CGFloat {
+    frameWidth(corners) * frameHeight(corners)
+}
+
+private func unitVector(from start: CGPoint, to end: CGPoint) -> CGPoint {
+    let dx = end.x - start.x
+    let dy = end.y - start.y
+    let length = hypot(dx, dy)
+    guard length > 0 else { return CGPoint(x: 1, y: 0) }
+    return CGPoint(x: dx / length, y: dy / length)
+}
+
+private func offsetPoint(_ point: CGPoint, _ direction: CGPoint, _ distance: CGFloat) -> CGPoint {
+    CGPoint(x: point.x + direction.x * distance, y: point.y + direction.y * distance)
+}
+
+private func midpoint(_ lhs: CGPoint, _ rhs: CGPoint) -> CGPoint {
+    CGPoint(x: (lhs.x + rhs.x) / 2, y: (lhs.y + rhs.y) / 2)
+}
+
+/// Which local edges a handle drag moves: a corner names one horizontal and one
+/// vertical edge, an edge handle names exactly one.
+private struct FrameEdges {
+    var left = false
+    var right = false
+    var bottom = false
+    var top = false
+}
+
+/// The resize an oriented selector performs, spelled out here exactly as the
+/// model's contract states it: the world pointer is mapped back through the
+/// entity's current matrix, the named local edges move to it, and the resulting
+/// local rectangle map composes *before* that matrix.
+///
+/// Stated this way the resize can only ever scale along the entity's own axes,
+/// which is what `orientedLocalResize` verifies — and what the world-hull
+/// pipeline below cannot do.
+private func localResizeTransform(
+    _ localBounds: CGRect,
+    under transform: CGAffineTransform,
+    pointer: CGPoint,
+    edges: FrameEdges
+) -> CGAffineTransform {
+    let local = pointer.applying(transform.inverted())
+    var minX = localBounds.minX
+    var maxX = localBounds.maxX
+    var minY = localBounds.minY
+    var maxY = localBounds.maxY
+    if edges.left { minX = local.x }
+    if edges.right { maxX = local.x }
+    if edges.bottom { minY = local.y }
+    if edges.top { maxY = local.y }
+    let edited = CGRect(
+        x: min(minX, maxX),
+        y: min(minY, maxY),
+        width: abs(maxX - minX),
+        height: abs(maxY - minY)
+    )
+    return PaintEntity.mapTransform(from: localBounds, to: edited).concatenating(transform)
+}
+
+/// The resize the pre-fix selector performed, kept as a control: measure the
+/// entity's *world* hull, stretch that hull axis-aligned, and compose the map
+/// after the entity's matrix. On anything rotated this is a shear, and repeated
+/// use feeds the hull's own slack back into the geometry.
+private func worldHullResizeTransform(
+    _ worldHull: CGRect,
+    under transform: CGAffineTransform,
+    to destination: CGRect
+) -> CGAffineTransform {
+    transform.concatenating(PaintEntity.mapTransform(from: worldHull, to: destination))
+}
+
 @MainActor
 final class ModelSmokeRun {
     private var scenario = "<none>"
@@ -249,13 +388,22 @@ final class ModelSmokeRun {
         try scenario("shape shift constraints") { try shapeConstraints() }
         try scenario("shape silhouettes") { try shapeSilhouettes() }
         try scenario("shape rendering and history") { try shapeRendering() }
-        try scenario("selection extraction") { try selectionExtraction() }
-        try scenario("selection move") { try selectionMove() }
-        try scenario("selection resize") { try selectionResize() }
-        try scenario("selection rotation") { try selectionRotation() }
-        try scenario("selection delete") { try selectionDelete() }
-        try scenario("selection clipping") { try selectionClipping() }
-        try scenario("selection no-ops") { try selectionNoOps() }
+        try scenario("entity creation and z-order") { try entityCreation() }
+        try scenario("entity hit testing") { try entityHitTesting() }
+        try scenario("shared entity transforms") { try sharedEntityTransforms() }
+        try scenario("entity move") { try entityMove() }
+        try scenario("entity resize") { try entityResize() }
+        try scenario("entity rotation") { try entityRotation() }
+        try scenario("entity local frame") { try entityLocalFrame() }
+        try scenario("oriented frame under rotation") { try orientedFrameUnderRotation() }
+        try scenario("oriented local resize") { try orientedLocalResize() }
+        try scenario("rotate resize cycles") { try rotateResizeCycles() }
+        try scenario("absolute transform replacement") { try absoluteTransformReplacement() }
+        try scenario("entity preview matches commit") { try entityPreviewMatchesCommit() }
+        try scenario("entity delete") { try entityDelete() }
+        try scenario("entity no-ops") { try entityNoOps() }
+        try scenario("entity flattening") { try entityFlattening() }
+        try scenario("entities in files") { try entitiesInFiles() }
         try scenario("resize and undo across dimensions") { try resizeAcrossDimensions() }
         try scenario("png save and reopen") { try pngSaveAndReopen() }
         try scenario("oriented image import") { try orientedImageImport() }
@@ -752,6 +900,8 @@ final class ModelSmokeRun {
         dab(document, at: CGPoint(x: 16, y: 16), tool: .brush)
         try expectInk(document, 16, 16, "committed dab")
         try expectFlags(document, undo: true, redo: false, dirty: true)
+        let committed = document.selectableEntityIDs
+        try expectEqual(committed.count, 1, "entities after the committed dab")
 
         document.beginStroke()
         document.drawStroke(
@@ -763,15 +913,45 @@ final class ModelSmokeRun {
         )
         try expectInk(document, 4, 4, "in-flight ink before cancel")
 
+        // The open drag is already one live entity, sitting on top of what was
+        // committed before it.
+        let inFlight = document.selectableEntityIDs
+        try expectEqual(inFlight.count, 2, "entities during an open stroke")
+        try expect(
+            Array(inFlight.prefix(1)) == committed,
+            "an open stroke must not disturb the entities beneath it"
+        )
+        try expectEntity(
+            document,
+            at: CGPoint(x: 4, y: 4),
+            tolerance: 1,
+            inFlight[1],
+            "the in-flight stroke"
+        )
+
         document.cancelStroke()
         try expectPixel(document, 4, 4, .white, "cancelled ink")
         try expectInk(document, 16, 16, "earlier committed dab survives cancel")
         try expectFlags(document, undo: true, redo: false, dirty: true)
+        try expect(
+            document.selectableEntityIDs == committed,
+            "cancelStroke must drop the pending entity and keep every other one"
+        )
+        try expectNoEntity(
+            document,
+            at: CGPoint(x: 4, y: 4),
+            tolerance: 2,
+            "the cancelled stroke"
+        )
 
         // A cancelled stroke recorded nothing, so one undo reaches the pristine bitmap.
         document.undo()
         try expectPixel(document, 16, 16, .white, "pristine after single undo")
         try expectFlags(document, undo: false, redo: true, dirty: false)
+        try expect(
+            document.selectableEntityIDs.isEmpty,
+            "undoing the dab removes its entity"
+        )
     }
 
     private func noOpFill() throws {
@@ -932,18 +1112,21 @@ final class ModelSmokeRun {
                 + describe(PaintTool.thickBrush.shortcut)
         )
 
-        // The selector: a non-shape tool with its own name, symbol and key.
+        // The selector: a hand tool, not a shape and not a marquee.
         try expect(
             !PaintTool.select.isShape,
-            "select drags out a marquee, not a shape: isShape must be false"
+            "select picks up existing content, it does not drag out a shape: "
+                + "isShape must be false"
         )
         try expect(
             PaintTool.select.title == "Select",
             "select title is \"\(PaintTool.select.title)\", expected \"Select\""
         )
         try expect(
-            PaintTool.select.symbolName == "cursorarrow.rays",
-            "select symbol is \"\(PaintTool.select.symbolName)\", expected \"cursorarrow.rays\""
+            PaintTool.select.symbolName == "hand.point.up.left.fill",
+            "select symbol is \"\(PaintTool.select.symbolName)\", expected "
+                + "\"hand.point.up.left.fill\" — the tool points at objects rather than "
+                + "dragging out an area"
         )
         try expect(
             PaintTool.select.shortcut == "s",
@@ -1575,789 +1758,1903 @@ final class ModelSmokeRun {
         }
     }
 
-    // MARK: Selection scenarios
+    // MARK: Entity scenarios
 
-    /// The four quadrant colours of the marker every selection scenario moves
-    /// around, plus the unrelated mark outside it and the secondary colour the
-    /// model must vacate source areas with. Deliberately asymmetric: a flip, a
-    /// transpose or a rotation the wrong way round changes at least two of the
-    /// four samples, so no such mistake can look like success.
-    private static let markerBottomLeft = NSColor(srgbRed: 1, green: 0, blue: 0, alpha: 1)
-    private static let markerBottomRight = NSColor(srgbRed: 0, green: 0.8, blue: 0, alpha: 1)
-    private static let markerTopRight = NSColor(srgbRed: 1, green: 0, blue: 1, alpha: 1)
-    private static let markerTopLeft = NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)
-    private static let outsideMark = NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)
-    private static let selectionBackground = NSColor(srgbRed: 1, green: 0.85, blue: 0, alpha: 1)
+    /// The canvas every entity scenario that shares the fixture below draws on.
+    private let entityCanvas = (width: 80, height: 60)
 
-    /// Canvas and marker geometry shared by the selection scenarios. The
-    /// oblong marker is 8×12 so a transform that swaps the axes cannot pass;
-    /// the square one exists for the rotation cases, where a quarter turn must
-    /// land back on its own footprint.
-    private let selectionCanvas = (width: 48, height: 36)
-    private let markerRect = CGRect(x: 4, y: 6, width: 8, height: 12)
-    private let squareMarkerRect = CGRect(x: 6, y: 6, width: 12, height: 12)
-    private let outsideRect = CGRect(x: 40, y: 2, width: 4, height: 4)
+    /// The four fixture entities, spelled out as literal geometry so every
+    /// bounds and hit-test expectation can be derived by hand instead of being
+    /// read back out of the model. Freehand coordinates sit at pixel centres so
+    /// the one-pixel pencil covers whole rows.
+    private let fixtureRect = (from: CGPoint(x: 8, y: 8), to: CGPoint(x: 32, y: 28))
+    private let fixtureLine = (from: CGPoint(x: 44, y: 10), to: CGPoint(x: 72, y: 26))
+    private let fixtureDoodle = [
+        CGPoint(x: 10.5, y: 40.5), CGPoint(x: 18.5, y: 48.5),
+        CGPoint(x: 26.5, y: 42.5), CGPoint(x: 34.5, y: 50.5),
+    ]
+    private let fixtureTextOrigin = CGPoint(x: 46, y: 44)
+    private let fixtureText = "Ab"
+    private let fixtureFontSize: CGFloat = 12
 
-    /// Extraction is a pure read of exactly the requested pixels, in the
-    /// orientation the image format stores them, and never touches the
-    /// document.
-    private func selectionExtraction() throws {
-        let document = try markerDocument(rect: markerRect)
-        let revision = document.revision
+    /// Every committed drawing is one independently selectable entity, appended
+    /// in z-order and checkpointed once. The eraser deliberately is not one.
+    private func entityCreation() throws {
+        let document = PaintDocument(width: entityCanvas.width, height: entityCanvas.height)
+        try expect(document.selectableEntityIDs.isEmpty, "a fresh document holds no entities")
+        try expectNoEntity(document, at: CGPoint(x: 20, y: 20), tolerance: 4, "a blank canvas")
 
-        let image = try requireSelection(document, markerRect, "marker selection")
-        try expectEqual(image.width, Int(markerRect.width), "selection image width")
-        try expectEqual(image.height, Int(markerRect.height), "selection image height")
-
-        // Row 0 of a `CGImage` is its *top* row, while the document counts
-        // upward from the bottom: the extracted corners must line up with the
-        // document's, so a crop taken upside down fails here.
-        let pixels = try raster(image)
-        try expectImagePixel(pixels, 0, 0, ModelSmokeRun.markerTopLeft, "extracted top-left")
-        try expectImagePixel(
-            pixels,
-            image.width - 1,
-            0,
-            ModelSmokeRun.markerTopRight,
-            "extracted top-right"
+        document.addShape(
+            tool: .rectangle,
+            from: fixtureRect.from,
+            to: fixtureRect.to,
+            color: .black,
+            constrained: false
         )
-        try expectImagePixel(
-            pixels,
-            0,
-            image.height - 1,
-            ModelSmokeRun.markerBottomLeft,
-            "extracted bottom-left"
+        let afterRect = document.selectableEntityIDs
+        try expectEqual(afterRect.count, 1, "entities after a shape")
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+
+        document.addShape(
+            tool: .line,
+            from: fixtureLine.from,
+            to: fixtureLine.to,
+            color: .black,
+            constrained: false
         )
-        try expectImagePixel(
-            pixels,
-            image.width - 1,
-            image.height - 1,
-            ModelSmokeRun.markerBottomRight,
-            "extracted bottom-right"
+        let afterLine = document.selectableEntityIDs
+        try expectEqual(afterLine.count, 2, "entities after a line")
+
+        doodle(document, fixtureDoodle)
+        let afterDoodle = document.selectableEntityIDs
+        try expectEqual(afterDoodle.count, 3, "entities after a freehand doodle")
+
+        document.addText(
+            fixtureText,
+            at: fixtureTextOrigin,
+            color: .black,
+            fontSize: fixtureFontSize
         )
-        // Interior sample: the quadrant boundaries sit where the document puts
-        // them, not half a selection away.
-        try expectImagePixel(
-            pixels,
-            image.width / 2,
-            image.height / 2,
-            ModelSmokeRun.markerBottomRight,
-            "extracted interior"
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 4, "entities after text")
+
+        // Appended, never reordered: each list is the previous one plus one new
+        // identifier, so the entity drawn last is the topmost.
+        try expect(
+            Array(afterLine.prefix(1)) == afterRect,
+            "the line must be appended above the shape, not inserted"
+        )
+        try expect(
+            Array(afterDoodle.prefix(2)) == afterLine,
+            "the doodle must be appended above the line, not inserted"
+        )
+        try expect(
+            Array(ids.prefix(3)) == afterDoodle,
+            "the text must be appended above the doodle, not inserted"
+        )
+        try expectEqual(Set(ids).count, 4, "distinct entity identifiers")
+
+        // Each entity knows the tight box of the ink it deposits: the drawn
+        // geometry padded by the width its tool embodies.
+        try expectBounds(
+            document,
+            ids[0],
+            CGRect(x: 6, y: 6, width: 28, height: 24),
+            "rectangle bounds"
+        )
+        try expectBounds(
+            document,
+            ids[1],
+            CGRect(x: 42, y: 8, width: 32, height: 20),
+            "line bounds"
+        )
+        try expectBounds(
+            document,
+            ids[2],
+            CGRect(x: 10, y: 40, width: 25, height: 11),
+            "doodle bounds"
+        )
+        try expectBounds(
+            document,
+            ids[3],
+            CGRect(origin: fixtureTextOrigin, size: textSize(fixtureText, fixtureFontSize)),
+            "text bounds"
         )
 
-        // Read only: no pixels changed, no revision bump, no history entry.
-        try expectEqual(document.revision, revision, "revision after selectionImage")
-        try expectFlags(document, undo: false, redo: false, dirty: false)
-        try expectMarker(document, in: markerRect, "document after extraction")
-
-        // A marquee dragged up and to the left describes the same pixels.
-        let flipped = CGRect(
-            x: markerRect.maxX,
-            y: markerRect.maxY,
-            width: -markerRect.width,
-            height: -markerRect.height
+        // The eraser paints the page colour instead of adding content, so it is
+        // the one stroke the model refuses to make selectable.
+        try expectInk(document, 18, 48, "doodle ink before erasing")
+        doodle(document, [CGPoint(x: 10, y: 44), CGPoint(x: 34, y: 44)], tool: .eraser)
+        try expect(
+            document.selectableEntityIDs == ids,
+            "an eraser stroke must add no selectable entity"
         )
-        let dragged = try requireSelection(document, flipped, "selection dragged up and left")
-        try expectEqual(dragged.width, Int(markerRect.width), "normalised selection width")
-        try expectEqual(dragged.height, Int(markerRect.height), "normalised selection height")
-        let draggedPixels = try raster(dragged)
-        try expectImagePixel(
-            draggedPixels,
-            0,
-            0,
-            ModelSmokeRun.markerTopLeft,
-            "normalised top-left"
-        )
-        try expectImagePixel(
-            draggedPixels,
-            dragged.width - 1,
-            dragged.height - 1,
-            ModelSmokeRun.markerBottomRight,
-            "normalised bottom-right"
+        try expectPixel(document, 18, 48, .white, "the eraser cleared the doodle")
+        try expectNoEntity(
+            document,
+            at: CGPoint(x: 38, y: 38),
+            tolerance: 4,
+            "pixels only the eraser painted"
         )
 
-        // Fractional drags snap outward to whole pixels, so a selection never
-        // carries a partial pixel.
-        let fractional = CGRect(
-            x: markerRect.minX + 0.3,
-            y: markerRect.minY + 0.2,
-            width: markerRect.width - 0.6,
-            height: markerRect.height - 0.5
+        // Five checkpoints: four entities and the eraser stroke, in that order.
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == ids,
+            "undoing the eraser stroke must leave the entities alone"
         )
-        let snapped = try requireSelection(document, fractional, "fractional selection")
-        try expectEqual(snapped.width, Int(markerRect.width), "snapped selection width")
-        try expectEqual(snapped.height, Int(markerRect.height), "snapped selection height")
-
-        // Overhanging the canvas keeps only the pixels that exist.
-        let overhang = CGRect(x: -6, y: -6, width: 12, height: 12)
-        let clamped = try requireSelection(document, overhang, "selection overhanging a corner")
-        try expectEqual(clamped.width, 6, "clamped selection width")
-        try expectEqual(clamped.height, 6, "clamped selection height")
-
-        // Nothing selectable at all: nil, never a zero-sized image.
-        let rejected = [
-            CGRect(x: markerRect.minX, y: markerRect.minY, width: 0, height: markerRect.height),
-            CGRect(x: markerRect.minX, y: markerRect.minY, width: markerRect.width, height: 0),
-            CGRect(x: 100, y: 100, width: 8, height: 12),
-            CGRect(x: -20, y: 6, width: 8, height: 12),
-            CGRect(x: CGFloat.nan, y: 6, width: 8, height: 12),
-            CGRect(x: 4, y: 6, width: CGFloat.infinity, height: 12),
-        ]
-        for request in rejected {
-            try expect(
-                document.selectionImage(in: request) == nil,
-                "selectionImage(in: \(request)) must be nil, not an empty image"
-            )
-        }
-        try expectEqual(document.revision, revision, "revision after rejected selections")
-        try expectFlags(document, undo: false, redo: false, dirty: false)
+        try expectInk(document, 18, 48, "doodle ink restored by undoing the eraser")
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == afterDoodle,
+            "one undo must remove exactly the topmost entity"
+        )
+        document.undo()
+        document.undo()
+        document.undo()
+        try expect(
+            document.selectableEntityIDs.isEmpty,
+            "unwinding every checkpoint must remove every entity"
+        )
+        try expectFlags(document, undo: false, redo: true, dirty: false)
+        try expectPixel(document, 20, 8, .white, "the canvas is blank again")
     }
 
-    /// Moving a selection: the pixels arrive exact and upright, the vacated
-    /// area takes the secondary colour, and the whole move is one undo entry.
-    private func selectionMove() throws {
-        let document = try markerDocument(rect: markerRect)
-        let revision = document.revision
-        let image = try requireSelection(document, markerRect, "marker selection")
-        let destination = markerRect.offsetBy(dx: 24, dy: -4)
+    /// A click selects the topmost entity it lands on — interior, outline,
+    /// stroked band or text box — and empty canvas selects nothing.
+    private func entityHitTesting() throws {
+        let fixture = try entityFixture()
+        let document = fixture.document
+        let rectangle = fixture.ids[0]
+        let line = fixture.ids[1]
+        let doodleID = fixture.ids[2]
+        let text = fixture.ids[3]
 
-        document.transformSelection(
-            image,
-            from: markerRect,
-            to: destination,
-            rotation: 0,
-            background: ModelSmokeRun.selectionBackground
+        // A closed shape is selected by its interior as well as its outline,
+        // exactly as a filled-looking object should behave.
+        try expectEntity(
+            document,
+            at: CGPoint(x: 12, y: 12),
+            tolerance: 1,
+            rectangle,
+            "the rectangle's interior"
+        )
+        try expectEntity(
+            document,
+            at: CGPoint(x: 8, y: 20),
+            tolerance: 1,
+            rectangle,
+            "the rectangle's outline"
         )
 
+        // Open geometry is selected by its stroked band, and the tolerance is
+        // really the slack: 8pt clear of the line misses, a generous tolerance
+        // reaches.
+        try expectEntity(
+            document,
+            at: CGPoint(x: 58, y: 18),
+            tolerance: 1,
+            line,
+            "the line's body"
+        )
+        try expectNoEntity(
+            document,
+            at: CGPoint(x: 54, y: 25),
+            tolerance: 2,
+            "8pt clear of the line"
+        )
+        try expectEntity(
+            document,
+            at: CGPoint(x: 54, y: 25),
+            tolerance: 12,
+            line,
+            "the same point with a 12pt tolerance"
+        )
+
+        try expectEntity(
+            document,
+            at: CGPoint(x: 18, y: 48),
+            tolerance: 2,
+            doodleID,
+            "the doodle's stroke"
+        )
+        try expectNoEntity(
+            document,
+            at: CGPoint(x: 18, y: 56),
+            tolerance: 2,
+            "clear of the doodle"
+        )
+
+        let glyphs = textSize(fixtureText, fixtureFontSize)
+        try expectEntity(
+            document,
+            at: CGPoint(
+                x: fixtureTextOrigin.x + glyphs.width / 2,
+                y: fixtureTextOrigin.y + glyphs.height / 2
+            ),
+            tolerance: 0,
+            text,
+            "the text's box"
+        )
+
+        for empty in [CGPoint(x: 2, y: 2), CGPoint(x: 70, y: 12), CGPoint(x: 76, y: 4)] {
+            try expectNoEntity(document, at: empty, tolerance: 2, "empty canvas at \(empty)")
+        }
+
+        // Where entities overlap the click takes the topmost one, which is the
+        // one drawn last.
+        document.addShape(
+            tool: .ellipse,
+            from: CGPoint(x: 20, y: 16),
+            to: CGPoint(x: 44, y: 36),
+            color: .black,
+            constrained: false
+        )
+        let stacked = document.selectableEntityIDs
+        try expectEqual(stacked.count, 5, "entities after the overlapping ellipse")
+        let ellipse = stacked[4]
+        try expectEntity(
+            document,
+            at: CGPoint(x: 26, y: 22),
+            tolerance: 1,
+            ellipse,
+            "where the ellipse covers the rectangle"
+        )
+        try expectEntity(
+            document,
+            at: CGPoint(x: 12, y: 12),
+            tolerance: 1,
+            rectangle,
+            "where the ellipse does not reach"
+        )
+
+        // The eraser sits on top of everything and is still never selected: the
+        // click falls through to the entity underneath.
+        doodle(document, [CGPoint(x: 10, y: 12), CGPoint(x: 30, y: 12)], tool: .eraser)
+        try expect(
+            document.selectableEntityIDs == stacked,
+            "an eraser stroke must stay unselectable"
+        )
+        try expectEntity(
+            document,
+            at: CGPoint(x: 20, y: 12),
+            tolerance: 1,
+            rectangle,
+            "an erased part of the rectangle"
+        )
+        try expectNoEntity(
+            document,
+            at: CGPoint(x: 36, y: 5),
+            tolerance: 1,
+            "pixels only the eraser painted"
+        )
+    }
+
+    /// The world-space matrices the canvas previews with and the model commits
+    /// through are one shared, deterministic definition.
+    private func sharedEntityTransforms() throws {
+        let move = PaintEntity.moveTransform(dx: 12, dy: -5)
+        try expect(
+            move == CGAffineTransform(translationX: 12, y: -5),
+            "moveTransform must be a pure translation, got \(move)"
+        )
+
+        // A handle drag means one thing: the old selection rectangle becomes
+        // the new one, on each axis independently.
+        let source = CGRect(x: 10, y: 10, width: 20, height: 10)
+        let destination = CGRect(x: 40, y: 25, width: 60, height: 20)
+        let map = PaintEntity.mapTransform(from: source, to: destination)
+        let mapped = source.applying(map)
+        try expect(
+            nearlyEqual(mapped, destination, 1e-6),
+            "mapTransform must carry the source onto the destination, got \(mapped)"
+        )
+        try expect(
+            nearlyEqual(map.a, 3, 1e-9) && nearlyEqual(map.d, 2, 1e-9),
+            "mapTransform must scale the axes independently (3×, 2×), got a=\(map.a) d=\(map.d)"
+        )
+        try expect(
+            PaintEntity.mapTransform(
+                from: CGRect(x: 10, y: 10, width: 0, height: 10),
+                to: destination
+            ) == .identity,
+            "a degenerate source rectangle defines no resize"
+        )
+
+        // Positive angles turn counterclockwise in this bottom-left space and
+        // leave the pivot alone, which is what makes a rotation handle
+        // predictable.
+        let pivot = CGPoint(x: 22, y: 14)
+        let quarter = PaintEntity.rotationTransform(by: .pi / 2, around: pivot)
+        let heldPivot = pivot.applying(quarter)
+        try expect(
+            nearlyEqual(heldPivot, pivot, 1e-6),
+            "the pivot must be fixed by its own rotation, got \(heldPivot)"
+        )
+        let turned = CGPoint(x: 34, y: 18).applying(quarter)
+        try expect(
+            nearlyEqual(turned, CGPoint(x: 18, y: 26), 1e-6),
+            "a quarter turn must carry the right-hand end upward, got \(turned)"
+        )
+        try expect(
+            PaintEntity.rotationTransform(by: 0, around: pivot) == .identity,
+            "a zero rotation is no edit"
+        )
+        try expect(
+            PaintEntity.rotationTransform(by: .nan, around: pivot) == .identity,
+            "a non-finite rotation is no edit"
+        )
+
+        // The guards the model's no-op rules are phrased against.
+        try expect(PaintEntity.isIdentity(.identity), "the identity must read as the identity")
+        try expect(!PaintEntity.isIdentity(move), "a translation is not the identity")
+        try expect(PaintEntity.isInvertible(map), "a resize matrix must be invertible")
+        let unusable: [CGAffineTransform] = [
+            CGAffineTransform(scaleX: 0, y: 1),
+            CGAffineTransform(scaleX: 1, y: 0),
+            CGAffineTransform(a: 2, b: 1, c: 4, d: 2, tx: 0, ty: 0),
+            CGAffineTransform(translationX: .nan, y: 4),
+            CGAffineTransform(a: .infinity, b: 0, c: 0, d: 1, tx: 0, ty: 0),
+        ]
+        for transform in unusable {
+            try expect(
+                !PaintEntity.isInvertible(transform),
+                "\(transform) collapses or breaks the geometry and must not be invertible"
+            )
+        }
+
+        // Composition order: the entity's own accumulated transform first, the
+        // world transform second. Any other order previews an edit somewhere
+        // the commit will not put it.
+        var entity = PaintEntity(
+            content: .shape(
+                tool: .rectangle,
+                from: .zero,
+                to: CGPoint(x: 10, y: 10),
+                color: .black
+            )
+        )
+        entity.applyWorldTransform(PaintEntity.moveTransform(dx: 20, dy: 0))
+        let placed = entity.bounds()
+        try expect(
+            nearlyEqual(placed, CGRect(x: 18, y: -2, width: 14, height: 14), 1e-6),
+            "the moved rectangle's ink box is \(placed), expected (18.0, -2.0, 14.0, 14.0)"
+        )
+        let world = CGAffineTransform(scaleX: 2, y: 3)
+        let previewed = entity.bounds(applying: world)
+        try expect(
+            nearlyEqual(previewed, placed.applying(world), 1e-6),
+            "a world transform must act on the entity where it already is: got \(previewed), "
+                + "expected \(placed.applying(world))"
+        )
+        try expect(
+            entity.hitTest(CGPoint(x: 25, y: 5), tolerance: 0),
+            "the moved rectangle must be hit where it now is"
+        )
+        try expect(
+            !entity.hitTest(CGPoint(x: 5, y: 5), tolerance: 0),
+            "the moved rectangle must not be hit where it was originally drawn"
+        )
+        entity.applyWorldTransform(world)
+        let committed = entity.bounds()
+        try expect(
+            nearlyEqual(committed, previewed, 1e-6),
+            "committing a world transform must land exactly where it previewed: got "
+                + "\(committed), previewed \(previewed)"
+        )
+    }
+
+    /// Dragging a selected entity moves that entity and nothing else, as one
+    /// undo entry, exactly where the preview said it would go.
+    private func entityMove() throws {
+        let document = PaintDocument(width: 80, height: 60)
+        document.addShape(
+            tool: .line,
+            from: CGPoint(x: 10, y: 10),
+            to: CGPoint(x: 34, y: 18),
+            color: .black,
+            constrained: false
+        )
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 8, y: 40),
+            to: CGPoint(x: 30, y: 56),
+            color: .black,
+            constrained: false
+        )
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 2, "entities before the move")
+        let moving = ids[0]
+        let neighbour = ids[1]
+        let before = try requireBounds(document, moving, .identity, "the line's bounds")
+        let neighbourBefore = try requireBounds(
+            document,
+            neighbour,
+            .identity,
+            "the neighbour's bounds"
+        )
+        try expectInk(document, 22, 14, "line ink before the move")
+        try expect(try isPage(document, 52, 38), "the destination is blank before the move")
+
+        let move = PaintEntity.moveTransform(dx: 30, dy: 24)
+        let expected = before.offsetBy(dx: 30, dy: 24)
+        let preview = try requireBounds(document, moving, move, "the previewed bounds")
+        try expect(
+            nearlyEqual(preview, expected, 1e-6),
+            "the drag preview must report \(expected), got \(preview)"
+        )
+
+        let revision = document.revision
+        document.transformEntity(moving, by: move)
         try expect(document.revision > revision, "a committed move must bump revision")
         try expectFlags(document, undo: true, redo: false, dirty: true)
-
-        // Whole pixels, no scaling: the marker must arrive exact, corners
-        // included, so a one-pixel or flipped redraw fails.
-        try expectMarker(document, in: destination, "moved marker")
-        try expectPixel(
-            document,
-            Int(destination.minX),
-            Int(destination.minY),
-            ModelSmokeRun.markerBottomLeft,
-            "moved marker corner"
+        try expect(
+            document.selectableEntityIDs == ids,
+            "moving an entity must not disturb the entity list or its order"
         )
-        try expectPixel(
-            document,
-            Int(destination.maxX) - 1,
-            Int(destination.maxY) - 1,
-            ModelSmokeRun.markerTopRight,
-            "moved marker opposite corner"
+        let landed = try requireBounds(document, moving, .identity, "the moved bounds")
+        try expect(
+            nearlyEqual(landed, expected, 1e-6),
+            "the commit must land where the preview showed: got \(landed), expected \(expected)"
         )
-
-        // Paint semantics: the whole vacated rectangle takes Color 2.
-        for point in [(4, 6), (11, 6), (4, 17), (11, 17), (7, 11)] {
-            try expectPixel(
-                document,
-                point.0,
-                point.1,
-                ModelSmokeRun.selectionBackground,
-                "vacated source pixel"
-            )
-        }
-        try expectPixel(document, 3, 9, .white, "page just left of the vacated area")
-        try expectPixel(document, 12, 9, .white, "page just right of the vacated area")
-        try expectPixel(document, 6, 5, .white, "page just below the vacated area")
-        try expectPixel(document, 6, 18, .white, "page just above the vacated area")
-        try expectPixel(
+        try expectInk(document, 52, 38, "line ink at its new place")
+        try expect(try isPage(document, 22, 14), "the line's old place must be blank")
+        try expectEntity(
             document,
-            Int(outsideRect.minX) + 1,
-            Int(outsideRect.minY) + 1,
-            ModelSmokeRun.outsideMark,
-            "unrelated content outside the selection"
+            at: CGPoint(x: 52, y: 38),
+            tolerance: 1,
+            moving,
+            "the moved line"
+        )
+        try expectNoEntity(
+            document,
+            at: CGPoint(x: 22, y: 14),
+            tolerance: 1,
+            "the line's old place"
         )
 
-        // One history entry for the whole move: a single undo is pristine.
+        // Entities move independently: the neighbour did not come along.
+        let neighbourAfter = try requireBounds(
+            document,
+            neighbour,
+            .identity,
+            "the neighbour's bounds after the move"
+        )
+        try expect(
+            nearlyEqual(neighbourAfter, neighbourBefore, 1e-9),
+            "the unselected entity must not move: \(neighbourAfter) vs \(neighbourBefore)"
+        )
+        try expectInk(document, 19, 40, "the neighbour's ink is untouched")
+
+        // One checkpoint for the whole move.
         document.undo()
-        try expectFlags(document, undo: false, redo: true, dirty: false)
-        try expectMarker(document, in: markerRect, "marker restored by undo")
-        try expectPixel(
-            document,
-            Int(destination.minX) + 1,
-            Int(destination.minY) + 1,
-            .white,
-            "destination cleared by undo"
+        try expectFlags(document, undo: true, redo: true, dirty: true)
+        let restored = try requireBounds(document, moving, .identity, "the restored bounds")
+        try expect(
+            nearlyEqual(restored, before, 1e-6),
+            "one undo must restore the original placement, got \(restored)"
         )
+        try expectInk(document, 22, 14, "line ink restored by undo")
+        try expect(try isPage(document, 52, 38), "the moved pixels are gone after undo")
 
         document.redo()
-        try expectFlags(document, undo: true, redo: false, dirty: true)
-        try expectMarker(document, in: destination, "marker restored by redo")
-        try expectPixel(
-            document,
-            6,
-            9,
-            ModelSmokeRun.selectionBackground,
-            "source stays vacated after redo"
-        )
-
-        // Overlapping move: the source is vacated *before* the draw, so the
-        // pixels that land back inside it survive and only the remainder shows
-        // background. Clearing afterwards would erase half the marker.
-        let overlapping = try markerDocument(rect: markerRect)
-        let selection = try requireSelection(overlapping, markerRect, "marker selection")
-        let shifted = markerRect.offsetBy(dx: markerRect.width / 2, dy: 0)
-        overlapping.transformSelection(
-            selection,
-            from: markerRect,
-            to: shifted,
-            rotation: 0,
-            background: ModelSmokeRun.selectionBackground
-        )
-        try expectMarker(overlapping, in: shifted, "marker after an overlapping move")
-        try expectPixel(
-            overlapping,
-            5,
-            9,
-            ModelSmokeRun.selectionBackground,
-            "strip vacated by an overlapping move"
-        )
-        try expectFlags(overlapping, undo: true, redo: false, dirty: true)
+        try expectInk(document, 52, 38, "line ink after redo")
+        try expect(try isPage(document, 22, 14), "the old place stays blank after redo")
     }
 
-    /// Resizing a selection stretches it into the destination rectangle on both
-    /// axes independently, as one undo entry.
-    private func selectionResize() throws {
-        let document = try markerDocument(rect: markerRect)
-        let image = try requireSelection(document, markerRect, "marker selection")
-        // Three times wider, twice as tall: a transform that preserves the
-        // aspect ratio, ignores the destination size or swaps the axes fails.
+    /// A handle drag stretches the entity into the new frame on each axis
+    /// independently, and the committed pixels follow the frame.
+    private func entityResize() throws {
+        let document = PaintDocument(width: 160, height: 120)
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 10, y: 10),
+            to: CGPoint(x: 30, y: 20),
+            color: .black,
+            constrained: false
+        )
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 1, "one entity to resize")
+        let id = ids[0]
+        let before = try requireBounds(document, id, .identity, "the shape's bounds")
+        try expect(
+            nearlyEqual(before, CGRect(x: 8, y: 8, width: 24, height: 14), 1e-6),
+            "the shape's ink box is \(before), expected (8.0, 8.0, 24.0, 14.0)"
+        )
+
+        // Three times as wide, twice as tall: a resize that keeps the aspect
+        // ratio, ignores the frame or swaps the axes cannot pass.
         let destination = CGRect(
-            x: 16,
-            y: 8,
-            width: markerRect.width * 3,
-            height: markerRect.height * 2
+            x: 40,
+            y: 24,
+            width: before.width * 3,
+            height: before.height * 2
+        )
+        let resize = PaintEntity.mapTransform(from: before, to: destination)
+        let preview = try requireBounds(document, id, resize, "the previewed frame")
+        try expect(
+            nearlyEqual(preview, destination, 1e-6),
+            "the resize preview must fill \(destination), got \(preview)"
         )
 
-        document.transformSelection(
-            image,
-            from: markerRect,
-            to: destination,
-            rotation: 0,
-            background: ModelSmokeRun.selectionBackground
+        document.transformEntity(id, by: resize)
+        let landed = try requireBounds(document, id, .identity, "the resized bounds")
+        try expect(
+            nearlyEqual(landed, destination, 1e-6),
+            "the commit must fill exactly the previewed frame: got \(landed)"
         )
         try expectFlags(document, undo: true, redo: false, dirty: true)
-        try expectMarker(document, in: destination, "stretched marker", exact: false)
 
-        // The stretch fills the destination: a pixel in from every corner still
-        // belongs to that corner's quadrant.
-        try expectNearestColor(
-            document,
-            Int(destination.minX) + 1,
-            Int(destination.minY) + 1,
-            ModelSmokeRun.markerBottomLeft,
-            "stretched bottom-left corner"
+        // WYSIWYG: the outline is stretched into the frame and stops there.
+        try expectInk(document, 76, 28, "the stretched bottom edge")
+        try expectInk(document, 76, 47, "the stretched top edge")
+        try expectInk(document, 46, 38, "the stretched left edge")
+        try expectInk(document, 105, 38, "the stretched right edge")
+        try expect(try isPage(document, 76, 38), "the stretched outline is not filled in")
+        try expect(
+            try isPage(document, 76, 60),
+            "a uniform scale would have put the top edge here: the axes must stretch "
+                + "independently"
         )
-        try expectNearestColor(
-            document,
-            Int(destination.maxX) - 2,
-            Int(destination.minY) + 1,
-            ModelSmokeRun.markerBottomRight,
-            "stretched bottom-right corner"
-        )
-        try expectNearestColor(
-            document,
-            Int(destination.minX) + 1,
-            Int(destination.maxY) - 2,
-            ModelSmokeRun.markerTopLeft,
-            "stretched top-left corner"
-        )
-        try expectNearestColor(
-            document,
-            Int(destination.maxX) - 2,
-            Int(destination.maxY) - 2,
-            ModelSmokeRun.markerTopRight,
-            "stretched top-right corner"
-        )
+        try expect(try isPage(document, 20, 10), "the shape's original place is blank")
 
-        // ...and nothing spilled past it.
-        try expectPixel(document, 15, 20, .white, "page left of the stretched marker")
-        try expectPixel(document, 41, 20, .white, "page right of the stretched marker")
-        try expectPixel(document, 22, 7, .white, "page below the stretched marker")
-        try expectPixel(document, 22, 33, .white, "page above the stretched marker")
-
-        try expectPixel(
-            document,
-            6,
-            9,
-            ModelSmokeRun.selectionBackground,
-            "vacated source after the stretch"
-        )
-        try expectPixel(
-            document,
-            10,
-            15,
-            ModelSmokeRun.selectionBackground,
-            "vacated source after the stretch"
-        )
-        try expectPixel(
-            document,
-            41,
-            3,
-            ModelSmokeRun.outsideMark,
-            "unrelated content after the stretch"
-        )
-
+        // One checkpoint.
         document.undo()
-        try expectFlags(document, undo: false, redo: true, dirty: false)
-        try expectMarker(document, in: markerRect, "marker restored by undo")
-        try expectPixel(document, 22, 14, .white, "destination cleared by undo")
+        let restored = try requireBounds(document, id, .identity, "the restored bounds")
+        try expect(
+            nearlyEqual(restored, before, 1e-6),
+            "one undo must restore the original frame, got \(restored)"
+        )
+        try expectInk(document, 20, 10, "the original outline is back")
+        try expect(try isPage(document, 76, 28), "the stretched pixels are gone")
 
         document.redo()
-        try expectFlags(document, undo: true, redo: false, dirty: true)
-        try expectMarker(document, in: destination, "stretched marker after redo", exact: false)
-
-        // Shrinking is the same operation the other way round.
-        let shrunk = try markerDocument(rect: markerRect)
-        let selection = try requireSelection(shrunk, markerRect, "marker selection")
-        let small = CGRect(x: 20, y: 20, width: 4, height: 6)
-        shrunk.transformSelection(
-            selection,
-            from: markerRect,
-            to: small,
-            rotation: 0,
-            background: ModelSmokeRun.selectionBackground
-        )
-        try expectMarker(shrunk, in: small, "shrunk marker", exact: false)
-        try expectPixel(
-            shrunk,
-            6,
-            9,
-            ModelSmokeRun.selectionBackground,
-            "vacated source after shrinking"
-        )
-        try expectFlags(shrunk, undo: true, redo: false, dirty: true)
+        try expectInk(document, 76, 28, "the stretched outline after redo")
     }
 
-    /// Rotation turns counterclockwise around the destination's centre, at any
-    /// angle, as one undo entry.
-    private func selectionRotation() throws {
-        let document = try markerDocument(rect: squareMarkerRect)
-        let revision = document.revision
-        let image = try requireSelection(document, squareMarkerRect, "square marker selection")
-        let destination = squareMarkerRect.offsetBy(dx: 24, dy: 12)
+    /// The rotation control turns the entity about its own centre, in the
+    /// direction the shared matrix promises, at any angle, as one undo entry.
+    private func entityRotation() throws {
+        let document = PaintDocument(width: 80, height: 60)
+        // An L: not symmetric under a half turn, so which way the entity turned
+        // is visible in the pixels rather than merely assumed.
+        doodle(
+            document,
+            [
+                CGPoint(x: 10.5, y: 10.5),
+                CGPoint(x: 30.5, y: 10.5),
+                CGPoint(x: 30.5, y: 26.5),
+            ]
+        )
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 1, "one entity to rotate")
+        let id = ids[0]
+        let before = try requireBounds(document, id, .identity, "the doodle's bounds")
+        try expect(
+            nearlyEqual(before, CGRect(x: 10, y: 10, width: 21, height: 17), 1e-6),
+            "the doodle's ink box is \(before), expected (10.0, 10.0, 21.0, 17.0)"
+        )
+        try expectInk(document, 20, 10, "the horizontal arm before the turn")
 
-        // A quarter turn counterclockwise carries the marker's bottom-left
-        // quadrant to the destination's bottom-right. That is what makes the
-        // direction of rotation observable rather than assumed.
-        document.transformSelection(
-            image,
-            from: squareMarkerRect,
-            to: destination,
-            rotation: .pi / 2,
-            background: ModelSmokeRun.selectionBackground
+        let pivot = CGPoint(x: before.midX, y: before.midY)
+        let quarter = PaintEntity.rotationTransform(by: .pi / 2, around: pivot)
+        // A quarter turn swaps the frame's extents about the pivot.
+        let expected = CGRect(
+            x: pivot.x - before.height / 2,
+            y: pivot.y - before.width / 2,
+            width: before.height,
+            height: before.width
         )
-        try expect(document.revision > revision, "a committed rotation must bump revision")
+        let preview = try requireBounds(document, id, quarter, "the previewed rotation")
+        try expect(
+            nearlyEqual(preview, expected, 0.01),
+            "the rotation preview must report \(expected), got \(preview)"
+        )
+
+        document.transformEntity(id, by: quarter)
+        let landed = try requireBounds(document, id, .identity, "the rotated bounds")
+        try expect(
+            nearlyEqual(landed, preview, 0.01),
+            "the commit must land where the preview showed: got \(landed), previewed \(preview)"
+        )
         try expectFlags(document, undo: true, redo: false, dirty: true)
-        try expectMarker(
-            document,
-            in: destination,
-            "marker turned a quarter counterclockwise",
-            rotatedBy: 1,
-            exact: false
+
+        // Counterclockwise: the arm that pointed right now points up.
+        try expectInk(document, 28, 14, "the turned vertical arm")
+        try expectInk(document, 14, 28, "the turned horizontal arm")
+        try expect(
+            try isPage(document, 14, 8),
+            "a clockwise quarter turn would have put the horizontal arm here"
         )
-        try expectPixel(
-            document,
-            9,
-            9,
-            ModelSmokeRun.selectionBackground,
-            "vacated source after the rotation"
-        )
-        try expectPixel(
-            document,
-            15,
-            15,
-            ModelSmokeRun.selectionBackground,
-            "vacated source after the rotation"
-        )
+        try expect(try isPage(document, 10, 10), "the doodle's old corner is blank")
 
         document.undo()
-        try expectFlags(document, undo: false, redo: true, dirty: false)
-        try expectMarker(document, in: squareMarkerRect, "marker restored by undo")
-        try expectPixel(
-            document,
-            Int(destination.midX),
-            Int(destination.midY),
-            .white,
-            "destination cleared by undo"
-        )
-
-        document.redo()
-        try expectFlags(document, undo: true, redo: false, dirty: true)
-        try expectMarker(
-            document,
-            in: destination,
-            "marker after redoing the rotation",
-            rotatedBy: 1,
-            exact: false
-        )
-
-        // The opposite sign turns the other way: stated separately so a
-        // transform that rotates clockwise cannot satisfy both scenarios.
-        let clockwise = try markerDocument(rect: squareMarkerRect)
-        let clockwiseImage = try requireSelection(
-            clockwise,
-            squareMarkerRect,
-            "square marker selection"
-        )
-        clockwise.transformSelection(
-            clockwiseImage,
-            from: squareMarkerRect,
-            to: destination,
-            rotation: -.pi / 2,
-            background: ModelSmokeRun.selectionBackground
-        )
-        try expectMarker(
-            clockwise,
-            in: destination,
-            "marker turned a quarter clockwise",
-            rotatedBy: -1,
-            exact: false
-        )
-
-        // Arbitrary angles are not a special case. At 45° the destination's own
-        // corners fall outside the rotated marker while its edge midpoints are
-        // overshot, so the committed pixels follow the turned outline instead
-        // of the axis-aligned box.
-        let diagonal = try markerDocument(rect: squareMarkerRect)
-        let diagonalImage = try requireSelection(
-            diagonal,
-            squareMarkerRect,
-            "square marker selection"
-        )
-        diagonal.transformSelection(
-            diagonalImage,
-            from: squareMarkerRect,
-            to: destination,
-            rotation: .pi / 4,
-            background: ModelSmokeRun.selectionBackground
-        )
-        try expectFlags(diagonal, undo: true, redo: false, dirty: true)
+        let unturned = try requireBounds(document, id, .identity, "the restored bounds")
         try expect(
-            !(try isPage(diagonal, 28, 24)),
-            "a 45° rotation must paint past the destination rectangle's left edge"
+            nearlyEqual(unturned, before, 1e-6),
+            "one undo must restore the original orientation, got \(unturned)"
         )
-        try expectPixel(
-            diagonal,
-            Int(destination.minX),
-            Int(destination.minY),
-            .white,
-            "the destination's own corner falls outside a 45° rotation"
+        try expectInk(document, 20, 10, "the horizontal arm is back")
+        try expect(try isPage(document, 28, 14), "the turned pixels are gone")
+
+        // Arbitrary angles are not a special case: the ink lands where the
+        // shared rotation says it does.
+        let tilted = PaintDocument(width: 80, height: 60)
+        tilted.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 20, y: 20),
+            to: CGPoint(x: 56, y: 40),
+            color: .black,
+            constrained: false
+        )
+        let tiltedIDs = tilted.selectableEntityIDs
+        try expectEqual(tiltedIDs.count, 1, "one entity to tilt")
+        let box = try requireBounds(tilted, tiltedIDs[0], .identity, "the rectangle's bounds")
+        try expectInk(tilted, 56, 40, "the rectangle's corner before the tilt")
+        let hinge = CGPoint(x: box.midX, y: box.midY)
+        let tilt = PaintEntity.rotationTransform(by: 0.4, around: hinge)
+        let tiltPreview = try requireBounds(tilted, tiltedIDs[0], tilt, "the previewed tilt")
+        tilted.transformEntity(tiltedIDs[0], by: tilt)
+        let tiltLanded = try requireBounds(tilted, tiltedIDs[0], .identity, "the tilted bounds")
+        try expect(
+            nearlyEqual(tiltLanded, tiltPreview, 1e-6),
+            "an arbitrary angle must commit exactly what it previewed: got \(tiltLanded), "
+                + "previewed \(tiltPreview)"
+        )
+        let edge = CGPoint(x: 38, y: 20).applying(tilt)
+        try expectInk(
+            tilted,
+            Int(edge.x.rounded(.down)),
+            Int(edge.y.rounded(.down)),
+            "the tilted bottom edge's midpoint"
+        )
+        try expect(try isPage(tilted, 56, 40), "the untilted corner is blank")
+    }
+
+    /// A selection is `{ localBounds, transform }`: the entity's own tight,
+    /// untransformed ink rectangle plus the matrix that places it. Both halves
+    /// are readable and independent, which is what lets a frame be rebuilt
+    /// after a commit instead of re-measured from the world.
+    private func entityLocalFrame() throws {
+        let document = PaintDocument(width: 200, height: 160)
+        // 80 × 32: deliberately not square, so an axis swap or a squared-off
+        // frame cannot pass unnoticed.
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 20, y: 20),
+            to: CGPoint(x: 100, y: 52),
+            color: .black,
+            constrained: false
+        )
+        let id = try onlyEntity(document)
+
+        let local = try requireLocalBounds(document, id, "the untouched local frame")
+        try expect(
+            nearlyEqual(local, CGRect(x: 18, y: 18, width: 84, height: 36), 1e-6),
+            "the local frame is \(local), expected the 4pt outline's box (18.0, 18.0, 84.0, 36.0)"
+        )
+        let start = try requireTransform(document, id, "the untouched matrix")
+        try expect(start == .identity, "a freshly drawn entity carries no edit, got \(start)")
+        // With nothing applied the local frame and the world ink box are one
+        // rectangle: the frame is the entity's own measurement, not a second,
+        // looser one taken in world space.
+        let world = try requireBounds(document, id, .identity, "the world ink box")
+        try expect(
+            nearlyEqual(world, local, 1e-9),
+            "an unedited entity's world box must be its local frame: \(world) vs \(local)"
         )
 
-        diagonal.undo()
-        try expectFlags(diagonal, undo: false, redo: true, dirty: false)
-        try expectMarker(diagonal, in: squareMarkerRect, "marker restored after a 45° rotation")
+        // The local frame is a property of the ink, not of the matrix.
+        var entity = PaintEntity(
+            content: .shape(
+                tool: .rectangle,
+                from: .zero,
+                to: CGPoint(x: 40, y: 10),
+                color: .black
+            )
+        )
+        let untouched = entity.localBounds
         try expect(
-            try isPage(diagonal, 28, 24),
-            "one undo must clear every pixel a 45° rotation painted"
+            nearlyEqual(untouched, CGRect(x: -2, y: -2, width: 44, height: 14), 1e-6),
+            "the local frame is \(untouched), expected (-2.0, -2.0, 44.0, 14.0)"
+        )
+        entity.applyWorldTransform(
+            PaintEntity.rotationTransform(by: 0.6, around: CGPoint(x: 5, y: 5))
+        )
+        try expect(
+            nearlyEqual(entity.localBounds, untouched, 1e-9),
+            "a rotated entity must still measure the same local frame, got \(entity.localBounds)"
+        )
+
+        // `bounds(using:)` answers for exactly the matrix handed in, ignoring
+        // the one the entity stores — that is what makes it usable as the
+        // preview half of a replacement edit.
+        let probe = CGAffineTransform(translationX: 30, y: 7)
+        try expect(
+            nearlyEqual(entity.bounds(using: probe), untouched.offsetBy(dx: 30, dy: 7), 1e-6),
+            "bounds(using:) must ignore the stored matrix, got \(entity.bounds(using: probe))"
+        )
+        try expect(
+            nearlyEqual(entity.bounds(using: .identity), untouched, 1e-9),
+            "bounds(using: .identity) must be the local frame, got "
+                + "\(entity.bounds(using: .identity))"
+        )
+        try expect(
+            entity.bounds(using: CGAffineTransform(scaleX: 0, y: 0)).isNull,
+            "a collapsed matrix frames nothing"
+        )
+        try expect(
+            PaintEntity(
+                content: .text(value: "", origin: .zero, color: .black, fontSize: 12)
+            ).localBounds.isNull,
+            "an entity that draws nothing has no local frame"
+        )
+
+        // Unknown identifiers have neither frame nor matrix, and a degenerate
+        // candidate matrix has no measurable box.
+        let stranger = UUID()
+        try expect(document.entityLocalBounds(stranger) == nil, "an unknown entity has no frame")
+        try expect(document.entityTransform(stranger) == nil, "an unknown entity has no matrix")
+        try expect(
+            document.entityBounds(stranger, using: .identity) == nil,
+            "an unknown entity measures nothing"
+        )
+        try expect(
+            document.entityBounds(id, using: CGAffineTransform(scaleX: 0, y: 0)) == nil,
+            "a collapsed candidate matrix measures nothing"
+        )
+
+        // An edit changes the matrix and only the matrix, so the frame the
+        // selector draws afterwards is the same rectangle in a new place.
+        let move = PaintEntity.moveTransform(dx: 12, dy: -4)
+        document.transformEntity(id, by: move)
+        let moved = try requireTransform(document, id, "the matrix after a move")
+        try expect(
+            moved == start.concatenating(move),
+            "the document must report the matrix it stores, got \(moved)"
+        )
+        let keptLocal = try requireLocalBounds(document, id, "the local frame after a move")
+        try expect(
+            nearlyEqual(keptLocal, local, 1e-9),
+            "a move must not touch the local frame: got \(keptLocal), expected \(local)"
+        )
+        let framed = frameCorners(keptLocal, moved)
+        let movedBox = try requireBounds(document, id, .identity, "the moved ink box")
+        try expect(
+            nearlyEqual(frameHull(framed), movedBox, 1e-6),
+            "under a translation the frame and the ink box still coincide: \(frameHull(framed)) "
+                + "vs \(movedBox)"
         )
     }
 
-    /// Deleting a selection repaints exactly its pixels with the secondary
-    /// colour, once, as one undo entry.
-    private func selectionDelete() throws {
-        let document = try markerDocument(rect: markerRect)
-        let revision = document.revision
+    /// Rotating an entity turns its frame and nothing else: the frame stays the
+    /// entity's own local rectangle seen through the entity's matrix, so it is
+    /// still tight and still square-cornered at any angle, before and after the
+    /// commit. Rebuilding it from a world-space hull instead — the pre-fix
+    /// behaviour — slackens it the moment the entity leaves the axes.
+    private func orientedFrameUnderRotation() throws {
+        let angles: [CGFloat] = [15 * .pi / 180, 30 * .pi / 180, 37 * .pi / 180, 1.1]
+        for angle in angles {
+            for fixture in try orientedFixtures() {
+                let document = fixture.document
+                let id = fixture.id
+                let label = "\(fixture.label) turned \(angle) rad"
 
-        document.deleteSelection(in: markerRect, background: ModelSmokeRun.selectionBackground)
-        try expect(document.revision > revision, "deleting a selection must bump revision")
-        try expectFlags(document, undo: true, redo: false, dirty: true)
+                let local = try requireLocalBounds(document, id, "\(label): the local frame")
+                let start = try requireTransform(document, id, "\(label): the starting matrix")
+                let upright = frameCorners(local, start)
+                let centre = CGPoint(x: local.midX, y: local.midY).applying(start)
+                let candidate = start.concatenating(
+                    PaintEntity.rotationTransform(by: angle, around: centre)
+                )
 
-        // Every pixel of the selection, edges and corners included.
-        for x in Int(markerRect.minX)..<Int(markerRect.maxX) {
-            for y in Int(markerRect.minY)..<Int(markerRect.maxY) {
-                try expectPixel(
+                let turned = frameCorners(local, candidate)
+                try expect(
+                    nearlyEqual(frameWidth(turned), frameWidth(upright), 1e-6)
+                        && nearlyEqual(frameHeight(turned), frameHeight(upright), 1e-6),
+                    "\(label): a rotation must turn the frame, not resize it: "
+                        + "\(frameWidth(turned))×\(frameHeight(turned)), expected "
+                        + "\(frameWidth(upright))×\(frameHeight(upright))"
+                )
+                try expect(
+                    frameShear(turned) <= 1e-9,
+                    "\(label): the rotated frame's axes must stay perpendicular, |cos| = "
+                        + "\(frameShear(turned))"
+                )
+                try expect(
+                    nearlyEqual(frameAngle(turned), frameAngle(upright) + angle, 1e-9),
+                    "\(label): the frame must be oriented with the entity: got angle "
+                        + "\(frameAngle(turned)), expected \(frameAngle(upright) + angle)"
+                )
+
+                // The hull a world-space measurement would frame really is
+                // slacker at this angle, so the tightness checks above are not
+                // quietly passing on an axis-aligned coincidence.
+                let hull = frameHull(turned)
+                try expect(
+                    hull.width * hull.height > frameArea(turned) * 1.02,
+                    "\(label): the axis-aligned hull must be visibly slacker than the oriented "
+                        + "frame (hull area \(hull.width * hull.height), frame area "
+                        + "\(frameArea(turned))), otherwise this angle proves nothing"
+                )
+
+                // The preview measures the candidate matrix itself, and the ink
+                // it reports sits inside the frame that frames it.
+                let previewBox = try requireBounds(
                     document,
-                    x,
-                    y,
-                    ModelSmokeRun.selectionBackground,
-                    "deleted selection pixel"
+                    id,
+                    using: candidate,
+                    "\(label): the previewed ink box"
+                )
+                try expect(
+                    hull.insetBy(dx: -0.01, dy: -0.01).contains(previewBox),
+                    "\(label): the oriented frame must contain the ink it frames: ink "
+                        + "\(previewBox), frame hull \(hull)"
+                )
+
+                let revision = document.revision
+                document.setEntityTransform(id, to: candidate)
+                try expect(
+                    document.revision > revision,
+                    "\(label): a committed rotation must bump revision"
+                )
+                try expectFlags(document, undo: true, redo: false, dirty: true)
+                let committed = try requireTransform(document, id, "\(label): the committed matrix")
+                try expect(
+                    committed == candidate,
+                    "\(label): the commit must store exactly the matrix that previewed: got "
+                        + "\(committed), expected \(candidate)"
+                )
+
+                // After the commit the frame is re-read, not re-measured: the
+                // same local rectangle through the new matrix. Replacing it with
+                // the committed world hull is the defect this covers.
+                let keptLocal = try requireLocalBounds(
+                    document,
+                    id,
+                    "\(label): the local frame after the commit"
+                )
+                try expect(
+                    nearlyEqual(keptLocal, local, 1e-9),
+                    "\(label): a rotation must leave the local frame untouched: got \(keptLocal), "
+                        + "expected \(local)"
+                )
+                let refreshed = frameCorners(keptLocal, committed)
+                try expect(
+                    nearlyEqual(frameWidth(refreshed), frameWidth(upright), 1e-6)
+                        && nearlyEqual(frameHeight(refreshed), frameHeight(upright), 1e-6)
+                        && frameShear(refreshed) <= 1e-9,
+                    "\(label): the refreshed frame must still be the tight, turned rectangle: "
+                        + "\(frameWidth(refreshed))×\(frameHeight(refreshed)), |cos| = "
+                        + "\(frameShear(refreshed))"
+                )
+                let committedBox = try requireBounds(
+                    document,
+                    id,
+                    .identity,
+                    "\(label): the committed ink box"
+                )
+                try expect(
+                    nearlyEqual(committedBox, previewBox, 1e-9),
+                    "\(label): the commit must ink exactly what the preview measured: got "
+                        + "\(committedBox), previewed \(previewBox)"
+                )
+
+                // One history step per commit, restoring the matrix verbatim.
+                document.undo()
+                let undone = try requireTransform(document, id, "\(label): the matrix after undo")
+                try expect(
+                    undone == start,
+                    "\(label): one undo must restore the replaced matrix: got \(undone), expected "
+                        + "\(start)"
+                )
+                document.redo()
+                let redone = try requireTransform(document, id, "\(label): the matrix after redo")
+                try expect(
+                    redone == candidate,
+                    "\(label): redo must reinstate the replacement, got \(redone)"
                 )
             }
         }
-        try expectPixel(document, 3, 9, .white, "page left of the deleted selection")
-        try expectPixel(document, 12, 9, .white, "page right of the deleted selection")
-        try expectPixel(document, 6, 5, .white, "page below the deleted selection")
-        try expectPixel(document, 6, 18, .white, "page above the deleted selection")
-        try expectPixel(
-            document,
-            41,
-            3,
-            ModelSmokeRun.outsideMark,
-            "unrelated content after a delete"
-        )
+    }
 
-        document.undo()
-        try expectFlags(document, undo: false, redo: true, dirty: false)
-        try expectMarker(document, in: markerRect, "marker restored by undo")
+    /// Resizing a rotated entity scales along the entity's own axes: the pointer
+    /// is mapped back through the current matrix, the named local edges move to
+    /// it, and the local map composes *before* that matrix. The frame therefore
+    /// stretches without ever losing its right angles.
+    ///
+    /// The pre-fix pipeline — stretch the world hull, compose after — is run
+    /// side by side as a control, because it shears, and a check that could not
+    /// tell the two apart would prove nothing.
+    private func orientedLocalResize() throws {
+        let angle: CGFloat = 37 * .pi / 180
+        for fixture in try orientedFixtures() {
+            let document = fixture.document
+            let id = fixture.id
+            let label = fixture.label
 
-        document.redo()
-        try expectFlags(document, undo: true, redo: false, dirty: true)
-        try expectPixel(
-            document,
-            6,
-            9,
-            ModelSmokeRun.selectionBackground,
-            "selection deleted again by redo"
-        )
-
-        // Clamped: a delete overhanging the canvas clears the pixels that exist
-        // and nothing else.
-        let clamped = try markerDocument(rect: markerRect)
-        clamped.deleteSelection(
-            in: CGRect(x: -4, y: -4, width: 8, height: 8),
-            background: ModelSmokeRun.selectionBackground
-        )
-        try expectFlags(clamped, undo: true, redo: false, dirty: true)
-        try expectPixel(
-            clamped,
-            0,
-            0,
-            ModelSmokeRun.selectionBackground,
-            "clamped delete clears the canvas corner"
-        )
-        try expectPixel(
-            clamped,
-            3,
-            3,
-            ModelSmokeRun.selectionBackground,
-            "clamped delete clears up to its edge"
-        )
-        try expectPixel(clamped, 4, 4, .white, "clamped delete stops at its edge")
-        try expectMarker(clamped, in: markerRect, "marker untouched by a clamped delete")
-
-        // Unusable geometry deletes nothing and records nothing.
-        let untouched = try markerDocument(rect: markerRect)
-        let quiet = untouched.revision
-        let rejected = [
-            CGRect(x: 4, y: 6, width: 0, height: 12),
-            CGRect(x: 4, y: 6, width: 8, height: 0),
-            CGRect(x: 100, y: 100, width: 8, height: 12),
-            CGRect(x: CGFloat.nan, y: 6, width: 8, height: 12),
-            CGRect(x: 4, y: CGFloat.infinity, width: 8, height: 12),
-        ]
-        for request in rejected {
-            untouched.deleteSelection(
-                in: request,
-                background: ModelSmokeRun.selectionBackground
+            let local = try requireLocalBounds(document, id, "\(label): the local frame")
+            let upright = try requireTransform(document, id, "\(label): the starting matrix")
+            let centre = CGPoint(x: local.midX, y: local.midY).applying(upright)
+            document.setEntityTransform(
+                id,
+                to: upright.concatenating(
+                    PaintEntity.rotationTransform(by: angle, around: centre)
+                )
             )
-            try expectEqual(
-                untouched.revision,
-                quiet,
-                "revision after deleteSelection(in: \(request))"
+            let transform = try requireTransform(document, id, "\(label): the rotated matrix")
+            let rotated = frameCorners(local, transform)
+            let axisX = unitVector(from: rotated[0], to: rotated[1])
+            let axisY = unitVector(from: rotated[0], to: rotated[3])
+
+            // Drag the right-hand edge handle straight out along the frame's own
+            // x axis: a pure local-x stretch, and nothing else.
+            let edgePointer = offsetPoint(midpoint(rotated[1], rotated[2]), axisX, 30)
+            let stretch = localResizeTransform(
+                local,
+                under: transform,
+                pointer: edgePointer,
+                edges: FrameEdges(right: true)
             )
-            try expectFlags(untouched, undo: false, redo: false, dirty: false)
+            let stretched = frameCorners(local, stretch)
+            try expect(
+                frameShear(stretched) <= 1e-9,
+                "\(label): resizing a rotated entity must not shear its frame, |cos| = "
+                    + "\(frameShear(stretched))"
+            )
+            try expect(
+                nearlyEqual(frameWidth(stretched), frameWidth(rotated) + 30, 1e-6),
+                "\(label): the dragged axis must follow the pointer: got "
+                    + "\(frameWidth(stretched)), expected \(frameWidth(rotated) + 30)"
+            )
+            try expect(
+                nearlyEqual(frameHeight(stretched), frameHeight(rotated), 1e-6),
+                "\(label): the untouched axis must keep its length: got "
+                    + "\(frameHeight(stretched)), expected \(frameHeight(rotated))"
+            )
+            try expect(
+                nearlyEqual(frameAngle(stretched), frameAngle(rotated), 1e-9),
+                "\(label): a resize must not turn the frame: got angle \(frameAngle(stretched)), "
+                    + "expected \(frameAngle(rotated))"
+            )
+            try expect(
+                nearlyEqual(stretched[0], rotated[0], 1e-6)
+                    && nearlyEqual(stretched[3], rotated[3], 1e-6),
+                "\(label): the edge opposite the handle must stay anchored: \(stretched[0]) and "
+                    + "\(stretched[3]) vs \(rotated[0]) and \(rotated[3])"
+            )
+            try expect(
+                nearlyEqual(stretched[1], offsetPoint(rotated[1], axisX, 30), 1e-6),
+                "\(label): the dragged corner must land under the pointer: got \(stretched[1]), "
+                    + "expected \(offsetPoint(rotated[1], axisX, 30))"
+            )
+
+            // Control: the pre-fix pipeline on the same gesture. Stretching the
+            // world hull and composing after the matrix shears a rotated entity,
+            // which is what makes the perpendicularity check above meaningful.
+            let hull = try requireBounds(document, id, .identity, "\(label): the rotated hull")
+            let sheared = frameCorners(
+                local,
+                worldHullResizeTransform(
+                    hull,
+                    under: transform,
+                    to: CGRect(
+                        x: hull.minX,
+                        y: hull.minY,
+                        width: hull.width + 30,
+                        height: hull.height
+                    )
+                )
+            )
+            try expect(
+                frameShear(sheared) > 0.1,
+                "\(label): the world-hull resize must visibly shear, otherwise the oriented "
+                    + "checks prove nothing: |cos| = \(frameShear(sheared))"
+            )
+
+            // A corner handle drags both local axes at once, by different
+            // amounts: still no shear, still no rotation, and genuinely
+            // non-uniform in the entity's own space.
+            let cornerPointer = offsetPoint(offsetPoint(rotated[2], axisX, 40), axisY, 10)
+            let corner = localResizeTransform(
+                local,
+                under: transform,
+                pointer: cornerPointer,
+                edges: FrameEdges(right: true, top: true)
+            )
+            let grown = frameCorners(local, corner)
+            try expect(
+                frameShear(grown) <= 1e-9,
+                "\(label): a corner drag must not shear the frame, |cos| = \(frameShear(grown))"
+            )
+            try expect(
+                nearlyEqual(frameWidth(grown), frameWidth(rotated) + 40, 1e-6)
+                    && nearlyEqual(frameHeight(grown), frameHeight(rotated) + 10, 1e-6),
+                "\(label): a corner drag must move both axes to the pointer: got "
+                    + "\(frameWidth(grown))×\(frameHeight(grown)), expected "
+                    + "\(frameWidth(rotated) + 40)×\(frameHeight(rotated) + 10)"
+            )
+            let scaleX = frameWidth(grown) / frameWidth(rotated)
+            let scaleY = frameHeight(grown) / frameHeight(rotated)
+            try expect(
+                abs(scaleX - scaleY) > 0.05,
+                "\(label): the corner drag must be non-uniform to be worth checking: \(scaleX) "
+                    + "vs \(scaleY)"
+            )
+            try expect(
+                nearlyEqual(grown[0], rotated[0], 1e-6),
+                "\(label): the corner opposite the handle is the anchor: got \(grown[0]), "
+                    + "expected \(rotated[0])"
+            )
+            try expect(
+                nearlyEqual(frameAngle(grown), frameAngle(rotated), 1e-9),
+                "\(label): a corner drag must not turn the frame: got angle \(frameAngle(grown))"
+            )
+
+            // Committing keeps the local frame and costs exactly one step.
+            let previewBox = try requireBounds(
+                document,
+                id,
+                using: corner,
+                "\(label): the previewed resize"
+            )
+            document.setEntityTransform(id, to: corner)
+            let committed = try requireTransform(document, id, "\(label): the resized matrix")
+            try expect(
+                committed == corner,
+                "\(label): the commit must store exactly the candidate matrix, got \(committed)"
+            )
+            let keptLocal = try requireLocalBounds(
+                document,
+                id,
+                "\(label): the local frame after the resize"
+            )
+            try expect(
+                nearlyEqual(keptLocal, local, 1e-9),
+                "\(label): a resize must leave the local frame alone — the frame is re-read as "
+                    + "{ localBounds, transform }, never re-measured from the world hull: got "
+                    + "\(keptLocal), expected \(local)"
+            )
+            let committedBox = try requireBounds(
+                document,
+                id,
+                .identity,
+                "\(label): the resized ink box"
+            )
+            try expect(
+                nearlyEqual(committedBox, previewBox, 1e-9),
+                "\(label): the resize must ink exactly what it previewed: got \(committedBox), "
+                    + "previewed \(previewBox)"
+            )
+            document.undo()
+            let undone = try requireTransform(document, id, "\(label): the matrix after undo")
+            try expect(
+                undone == transform,
+                "\(label): one undo must reverse the whole resize: got \(undone), expected "
+                    + "\(transform)"
+            )
+            document.redo()
+            let redone = try requireTransform(document, id, "\(label): the matrix after redo")
+            try expect(
+                redone == corner,
+                "\(label): redo must reinstate the resize, got \(redone)"
+            )
         }
-        try expectMarker(untouched, in: markerRect, "marker after rejected deletes")
     }
 
-    /// A destination hanging off the canvas paints what fits, clears the whole
-    /// source and leaves the canvas dimensions alone.
-    private func selectionClipping() throws {
-        let document = try markerDocument(rect: markerRect)
-        let image = try requireSelection(document, markerRect, "marker selection")
-        // Dragged off the top-left: only the marker's bottom-right quadrant
-        // still lands on the canvas.
-        let destination = CGRect(
-            x: -4,
-            y: 30,
-            width: markerRect.width,
-            height: markerRect.height
+    /// Rotate, resize, repeat. Every cycle must land the frame the drag asked
+    /// for — exactly, with square corners — because the frame is rebuilt from
+    /// the entity's unchanged local rectangle every time.
+    ///
+    /// The pre-fix pipeline runs in lockstep as a control: it re-measures a
+    /// world hull that is slacker than the true frame the moment the entity is
+    /// off-axis, feeds that slack back in on the next cycle, and so both shears
+    /// and inflates. That divergence is the regression this scenario pins down.
+    private func rotateResizeCycles() throws {
+        let document = PaintDocument(width: 320, height: 260)
+        let from = CGPoint(x: 60, y: 80)
+        let to = CGPoint(x: 160, y: 120)
+        document.addShape(tool: .rectangle, from: from, to: to, color: .black, constrained: false)
+        let id = try onlyEntity(document)
+
+        let local = try requireLocalBounds(document, id, "the local frame")
+        let start = try requireTransform(document, id, "the starting matrix")
+        var expectedWidth = frameWidth(frameCorners(local, start))
+        let expectedHeight = frameHeight(frameCorners(local, start))
+
+        // The control carries the same ink through the same gestures, resized
+        // the pre-fix way.
+        var control = PaintEntity(
+            content: .shape(tool: .rectangle, from: from, to: to, color: .black)
+        )
+        try expect(
+            nearlyEqual(control.localBounds, local, 1e-9),
+            "the control must measure the same local frame as the document's entity: "
+                + "\(control.localBounds) vs \(local)"
         )
 
-        document.transformSelection(
-            image,
-            from: markerRect,
-            to: destination,
-            rotation: 0,
-            background: ModelSmokeRun.selectionBackground
-        )
-        try expectSize(document, selectionCanvas.width, selectionCanvas.height)
-        try expectFlags(document, undo: true, redo: false, dirty: true)
-        try expectPixel(
-            document,
-            0,
-            30,
-            ModelSmokeRun.markerBottomRight,
-            "clipped marker on the canvas"
-        )
-        try expectPixel(
-            document,
-            3,
-            35,
-            ModelSmokeRun.markerBottomRight,
-            "clipped marker at the canvas edge"
-        )
-        try expectPixel(document, 4, 33, .white, "page just beyond the clipped marker")
-        try expectPixel(document, 1, 29, .white, "page just below the clipped marker")
+        let step: CGFloat = 15 * .pi / 180
+        for cycle in 1...4 {
+            let before = try requireTransform(document, id, "cycle \(cycle): the matrix")
+            let centre = CGPoint(x: local.midX, y: local.midY).applying(before)
+            document.setEntityTransform(
+                id,
+                to: before.concatenating(PaintEntity.rotationTransform(by: step, around: centre))
+            )
+            let turned = try requireTransform(document, id, "cycle \(cycle): the rotated matrix")
+            let rotated = frameCorners(local, turned)
+            try expect(
+                nearlyEqual(frameWidth(rotated), expectedWidth, 1e-6)
+                    && nearlyEqual(frameHeight(rotated), expectedHeight, 1e-6),
+                "cycle \(cycle): rotation must not inflate the frame: got "
+                    + "\(frameWidth(rotated))×\(frameHeight(rotated)), expected "
+                    + "\(expectedWidth)×\(expectedHeight)"
+            )
+            try expect(
+                frameShear(rotated) <= 1e-9,
+                "cycle \(cycle): rotation must not shear the frame, |cos| = \(frameShear(rotated))"
+            )
 
-        // The source is vacated in full even though most of the selection never
-        // reached the canvas.
-        try expectPixel(
-            document,
-            6,
-            9,
-            ModelSmokeRun.selectionBackground,
-            "vacated source after a clipped move"
+            // Stretch the local x axis by a tenth, through the same pointer
+            // arithmetic a handle drag produces.
+            let pointer = offsetPoint(
+                midpoint(rotated[1], rotated[2]),
+                unitVector(from: rotated[0], to: rotated[1]),
+                expectedWidth * 0.1
+            )
+            document.setEntityTransform(
+                id,
+                to: localResizeTransform(
+                    local,
+                    under: turned,
+                    pointer: pointer,
+                    edges: FrameEdges(right: true)
+                )
+            )
+            expectedWidth *= 1.1
+            let resizedMatrix = try requireTransform(
+                document,
+                id,
+                "cycle \(cycle): the resized matrix"
+            )
+            let resized = frameCorners(local, resizedMatrix)
+            try expect(
+                nearlyEqual(frameWidth(resized), expectedWidth, 1e-6),
+                "cycle \(cycle): the frame must be exactly the width the drag asked for: got "
+                    + "\(frameWidth(resized)), expected \(expectedWidth)"
+            )
+            try expect(
+                nearlyEqual(frameHeight(resized), expectedHeight, 1e-6),
+                "cycle \(cycle): the untouched axis must not creep: got "
+                    + "\(frameHeight(resized)), expected \(expectedHeight)"
+            )
+            try expect(
+                frameShear(resized) <= 1e-9,
+                "cycle \(cycle): repeated rotate-resize cycles must not shear the frame, |cos| = "
+                    + "\(frameShear(resized))"
+            )
+            let cycleLocal = try requireLocalBounds(
+                document,
+                id,
+                "cycle \(cycle): the local frame"
+            )
+            try expect(
+                nearlyEqual(cycleLocal, local, 1e-9),
+                "cycle \(cycle): the local frame must survive every cycle untouched: got "
+                    + "\(cycleLocal), expected \(local)"
+            )
+
+            // The control's cycle: rotate about its re-measured hull's centre,
+            // then stretch that hull axis-aligned by the same tenth.
+            let controlHull = control.bounds()
+            control.applyWorldTransform(
+                PaintEntity.rotationTransform(
+                    by: step,
+                    around: CGPoint(x: controlHull.midX, y: controlHull.midY)
+                )
+            )
+            let turnedHull = control.bounds()
+            control.transform = worldHullResizeTransform(
+                turnedHull,
+                under: control.transform,
+                to: CGRect(
+                    x: turnedHull.minX,
+                    y: turnedHull.minY,
+                    width: turnedHull.width * 1.1,
+                    height: turnedHull.height
+                )
+            )
+        }
+
+        // Four cycles in: the oriented frame is exactly the rectangle the drags
+        // asked for, and the ink it frames is inside it.
+        let finalMatrix = try requireTransform(document, id, "the matrix after four cycles")
+        let finalFrame = frameCorners(local, finalMatrix)
+        try expect(
+            nearlyEqual(frameWidth(finalFrame), expectedWidth, 1e-6)
+                && nearlyEqual(frameHeight(finalFrame), expectedHeight, 1e-6),
+            "four cycles must compound to \(expectedWidth)×\(expectedHeight), got "
+                + "\(frameWidth(finalFrame))×\(frameHeight(finalFrame))"
         )
-        try expectPixel(
-            document,
-            11,
-            17,
-            ModelSmokeRun.selectionBackground,
-            "vacated source after a clipped move"
+        let finalHull = frameHull(finalFrame)
+        let finalInk = try requireBounds(document, id, .identity, "the ink after four cycles")
+        try expect(
+            finalHull.insetBy(dx: -0.01, dy: -0.01).contains(finalInk),
+            "the frame must still contain its ink: ink \(finalInk), frame hull \(finalHull)"
         )
 
-        document.undo()
-        try expectFlags(document, undo: false, redo: true, dirty: false)
-        try expectMarker(document, in: markerRect, "marker restored after a clipped move")
-        try expectPixel(document, 0, 30, .white, "clipped pixels cleared by undo")
+        // ...whereas the world-hull control has sheared and inflated, so the
+        // equalities above are discriminating rather than tautological.
+        let controlFrame = frameCorners(local, control.transform)
+        try expect(
+            frameShear(controlFrame) > 0.2,
+            "the world-hull control must have sheared badly by now, |cos| = "
+                + "\(frameShear(controlFrame))"
+        )
+        let controlBox = control.bounds()
+        try expect(
+            controlBox.width * controlBox.height > expectedWidth * expectedHeight * 1.5,
+            "the world-hull control must have inflated well past the requested frame: hull area "
+                + "\(controlBox.width * controlBox.height) vs requested "
+                + "\(expectedWidth * expectedHeight)"
+        )
+        try expect(
+            abs(frameWidth(controlFrame) - expectedWidth) > 1,
+            "the world-hull control must not land the frame the drags asked for: got "
+                + "\(frameWidth(controlFrame)), requested \(expectedWidth)"
+        )
 
-        document.redo()
-        try expectFlags(document, undo: true, redo: false, dirty: true)
-        try expectPixel(
+        // Eight commits, eight undo steps, unwinding to the original matrix.
+        for _ in 0..<8 {
+            document.undo()
+        }
+        let unwound = try requireTransform(document, id, "the matrix after unwinding")
+        try expect(
+            unwound == start,
+            "each rotate and each resize must be one undo step: got \(unwound), expected \(start)"
+        )
+        let unwoundLocal = try requireLocalBounds(
             document,
-            0,
-            30,
-            ModelSmokeRun.markerBottomRight,
-            "clipped marker after redo"
+            id,
+            "the local frame after unwinding"
         )
-
-        // A source rectangle that is itself off canvas has nothing to vacate,
-        // and must still draw what lands on the page.
-        let offCanvas = try markerDocument(rect: markerRect)
-        let selection = try requireSelection(offCanvas, markerRect, "marker selection")
-        let landing = CGRect(x: 20, y: 20, width: markerRect.width, height: markerRect.height)
-        offCanvas.transformSelection(
-            selection,
-            from: CGRect(x: 100, y: 100, width: markerRect.width, height: markerRect.height),
-            to: landing,
-            rotation: 0,
-            background: ModelSmokeRun.selectionBackground
+        try expect(
+            nearlyEqual(unwoundLocal, local, 1e-9),
+            "unwinding must leave the local frame as it always was, got \(unwoundLocal)"
         )
-        try expectFlags(offCanvas, undo: true, redo: false, dirty: true)
-        try expectMarker(offCanvas, in: landing, "marker drawn from an off-canvas source")
-        try expectMarker(offCanvas, in: markerRect, "marker left alone by an off-canvas source")
     }
 
-    /// Requests that cannot change a pixel change neither the bitmap nor the
-    /// history: no revision bump, no undo entry, no dirty flag.
-    private func selectionNoOps() throws {
-        let document = try markerDocument(rect: markerRect)
-        let image = try requireSelection(document, markerRect, "marker selection")
+    /// A replacement matrix previews and commits the very same pixels, and a
+    /// replacement that cannot change anything changes nothing at all.
+    private func absoluteTransformReplacement() throws {
+        let document = PaintDocument(width: 120, height: 100)
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 8, y: 8),
+            to: CGPoint(x: 40, y: 30),
+            color: .black,
+            constrained: false
+        )
+        doodle(
+            document,
+            [
+                CGPoint(x: 14.5, y: 44.5),
+                CGPoint(x: 40.5, y: 62.5),
+                CGPoint(x: 62.5, y: 48.5),
+            ]
+        )
+        document.addText("Ab", at: CGPoint(x: 78, y: 70), color: .black, fontSize: 12)
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 3, "entities before the replacement")
+        let selected = ids[1]
+
+        // The entity already carries an edit, so the candidate has to be built
+        // from the matrix it stores rather than from nothing.
+        document.transformEntity(selected, by: PaintEntity.moveTransform(dx: 6, dy: -3))
+        let local = try requireLocalBounds(document, selected, "the doodle's local frame")
+        let placed = try requireTransform(document, selected, "the doodle's matrix")
+
+        // Rotate, then stretch one local edge: the composed matrix a selector
+        // hands over at mouse-up.
+        let centre = CGPoint(x: local.midX, y: local.midY).applying(placed)
+        let rotated = placed.concatenating(
+            PaintEntity.rotationTransform(by: 15 * .pi / 180, around: centre)
+        )
+        let corners = frameCorners(local, rotated)
+        let pointer = offsetPoint(
+            midpoint(corners[1], corners[2]),
+            unitVector(from: corners[0], to: corners[1]),
+            10
+        )
+        let candidate = localResizeTransform(
+            local,
+            under: rotated,
+            pointer: pointer,
+            edges: FrameEdges(right: true)
+        )
+        try expect(
+            frameShear(frameCorners(local, candidate)) <= 1e-9,
+            "the candidate must keep the frame's axes perpendicular, |cos| = "
+                + "\(frameShear(frameCorners(local, candidate)))"
+        )
+        let previewBounds = try requireBounds(
+            document,
+            selected,
+            using: candidate,
+            "the previewed ink box"
+        )
+
+        // What the canvas paints while the gesture is live: the scene without
+        // the entity, plus the entity under exactly the candidate matrix.
+        let backdropImage = try requireImage(
+            document.renderedImage(excludingEntity: selected),
+            "the scene without the selected entity"
+        )
+        let context = try canvasContext(document.pixelWidth, document.pixelHeight)
+        context.draw(
+            backdropImage,
+            in: CGRect(x: 0, y: 0, width: document.pixelWidth, height: document.pixelHeight)
+        )
+        document.drawEntity(selected, in: context, using: candidate)
+        let preview = try raster(try requireImage(context.makeImage(), "the replacement preview"))
+
+        document.setEntityTransform(selected, to: candidate)
+        let committedBounds = try requireBounds(
+            document,
+            selected,
+            .identity,
+            "the committed ink box"
+        )
+        try expect(
+            nearlyEqual(committedBounds, previewBounds, 1e-9),
+            "the commit must measure exactly what the preview did: got \(committedBounds), "
+                + "previewed \(previewBounds)"
+        )
+        let committed = try raster(try requireImage(document.cgImage, "the committed image"))
+        let drift = try rasterDifference(preview, committed, slack: 4)
+        let pixels = preview.width * preview.height
+        try expect(
+            drift.differing * 500 <= pixels,
+            "an absolute preview and its commit must compose to the same pixels: "
+                + "\(drift.differing) of \(pixels) differ (worst channel \(drift.worst))"
+        )
+
+        // Replacements that cannot change anything: no matrix, no history, no
+        // pixels.
+        let matrix = try requireTransform(document, selected, "the matrix a no-op must preserve")
         let revision = document.revision
-
-        // Put back exactly where it came from, unrotated.
-        document.transformSelection(
-            image,
-            from: markerRect,
-            to: markerRect,
-            rotation: 0,
-            background: ModelSmokeRun.selectionBackground
-        )
-        try expectEqual(document.revision, revision, "revision after an identity transform")
-        try expectFlags(document, undo: false, redo: false, dirty: false)
-        try expectMarker(document, in: markerRect, "marker after an identity transform")
-
-        // The same identity, reached from a rectangle dragged the other way and
-        // an angle far below one pixel of movement.
-        document.transformSelection(
-            image,
-            from: markerRect,
-            to: CGRect(
-                x: markerRect.maxX,
-                y: markerRect.maxY,
-                width: -markerRect.width,
-                height: -markerRect.height
-            ),
-            rotation: 1e-9,
-            background: ModelSmokeRun.selectionBackground
-        )
-        try expectEqual(
-            document.revision,
-            revision,
-            "revision after a normalised identity transform"
-        )
-        try expectFlags(document, undo: false, redo: false, dirty: false)
-
-        // Degenerate, non-finite and wholly off-canvas geometry.
-        let rejected: [(source: CGRect, destination: CGRect, rotation: CGFloat)] = [
-            (markerRect, CGRect(x: 20, y: 20, width: 0, height: 12), 0),
-            (markerRect, CGRect(x: 20, y: 20, width: 8, height: 0), 0),
-            (markerRect, CGRect(x: CGFloat.nan, y: 20, width: 8, height: 12), 0),
-            (markerRect, CGRect(x: 20, y: 20, width: CGFloat.infinity, height: 12), 0),
-            (
-                CGRect(x: CGFloat.nan, y: 6, width: 8, height: 12),
-                CGRect(x: 20, y: 20, width: 8, height: 12),
-                0
-            ),
-            (markerRect, CGRect(x: 20, y: 20, width: 8, height: 12), CGFloat.nan),
-            (
-                CGRect(x: 100, y: 100, width: 8, height: 12),
-                CGRect(x: 200, y: 200, width: 8, height: 12),
-                0
-            ),
+        let undoable = document.canUndo
+        let redoable = document.canRedo
+        let before = try raster(try requireImage(document.cgImage, "the image before the no-ops"))
+        let rejected: [(transform: CGAffineTransform, description: String)] = [
+            (matrix, "the matrix the entity already stores"),
+            (CGAffineTransform(scaleX: 0, y: 1), "a matrix that collapses the x axis"),
+            (CGAffineTransform(scaleX: 1, y: 0), "a matrix that collapses the y axis"),
+            (CGAffineTransform(a: 2, b: 1, c: 4, d: 2, tx: 0, ty: 0), "a singular matrix"),
+            (CGAffineTransform(translationX: .nan, y: 4), "a non-finite translation"),
+            (CGAffineTransform(a: .infinity, b: 0, c: 0, d: 1, tx: 0, ty: 0), "a non-finite scale"),
         ]
-        for request in rejected {
-            document.transformSelection(
-                image,
-                from: request.source,
-                to: request.destination,
-                rotation: request.rotation,
-                background: ModelSmokeRun.selectionBackground
+        for rejection in rejected {
+            document.setEntityTransform(selected, to: rejection.transform)
+            let held = try requireTransform(
+                document,
+                selected,
+                "the matrix after \(rejection.description)"
+            )
+            try expect(
+                held == matrix,
+                "\(rejection.description) must not be committed: the entity now holds \(held)"
             )
             try expectEqual(
                 document.revision,
                 revision,
-                "revision after transformSelection(from: \(request.source), "
-                    + "to: \(request.destination), rotation: \(request.rotation))"
+                "revision after \(rejection.description)"
             )
-            try expectFlags(document, undo: false, redo: false, dirty: false)
+            try expect(
+                document.canUndo == undoable && document.canRedo == redoable,
+                "history flags after \(rejection.description): canUndo \(document.canUndo), "
+                    + "canRedo \(document.canRedo)"
+            )
         }
-        try expectMarker(document, in: markerRect, "marker after every rejected transform")
-        try expectPixel(
+        document.setEntityTransform(UUID(), to: CGAffineTransform(translationX: 5, y: 5))
+        try expectEqual(document.revision, revision, "revision after an unknown identifier")
+        let untouched = try requireTransform(
             document,
-            41,
-            3,
-            ModelSmokeRun.outsideMark,
-            "unrelated content after every rejected transform"
+            selected,
+            "the matrix after an unknown identifier"
+        )
+        try expect(
+            untouched == matrix,
+            "an unknown identifier must transform nothing, got \(untouched)"
+        )
+        let after = try raster(try requireImage(document.cgImage, "the image after the no-ops"))
+        try expectEqual(
+            try rasterDifference(before, after).differing,
+            0,
+            "pixels a rejected replacement changed"
         )
 
-        // A real transform after all those rejections still records exactly one
-        // entry, so nothing above left a half-open operation behind.
-        document.transformSelection(
-            image,
-            from: markerRect,
-            to: markerRect.offsetBy(dx: 20, dy: 10),
-            rotation: 0,
-            background: ModelSmokeRun.selectionBackground
+        // The identity is not a no-op: it is how an entity is put back where it
+        // was drawn, and it commits like any other replacement.
+        document.setEntityTransform(selected, to: .identity)
+        try expect(
+            document.revision > revision,
+            "resetting a transformed entity to the identity is a real edit"
         )
-        try expectFlags(document, undo: true, redo: false, dirty: true)
+        let reset = try requireTransform(document, selected, "the matrix after the reset")
+        try expect(reset == .identity, "the reset must store the identity, got \(reset)")
+        let keptLocal = try requireLocalBounds(
+            document,
+            selected,
+            "the local frame after the reset"
+        )
+        try expect(
+            nearlyEqual(keptLocal, local, 1e-9),
+            "no replacement may rewrite the local frame: got \(keptLocal), expected \(local)"
+        )
+        let resetBox = try requireBounds(document, selected, .identity, "the ink box after reset")
+        try expect(
+            nearlyEqual(resetBox, local, 1e-9),
+            "with the identity stored the ink box is the local frame: got \(resetBox)"
+        )
         document.undo()
+        let restored = try requireTransform(
+            document,
+            selected,
+            "the matrix after undoing the reset"
+        )
+        try expect(
+            restored == candidate,
+            "one undo must restore the matrix the reset replaced, got \(restored)"
+        )
+    }
+
+    /// The live drag preview and the committed document are the same pixels:
+    /// the scene without the selected entity, plus that entity through the drag
+    /// matrix, composed in one order only.
+    private func entityPreviewMatchesCommit() throws {
+        let document = PaintDocument(width: 80, height: 60)
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 6, y: 6),
+            to: CGPoint(x: 30, y: 26),
+            color: .black,
+            constrained: false
+        )
+        doodle(
+            document,
+            [
+                CGPoint(x: 12.5, y: 34.5),
+                CGPoint(x: 22.5, y: 44.5),
+                CGPoint(x: 30.5, y: 36.5),
+            ]
+        )
+        document.addText("Ab", at: CGPoint(x: 58, y: 44), color: .black, fontSize: 12)
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 3, "entities before the drag")
+        let selected = ids[1]
+
+        // The entity already carries an earlier edit, so the drag matrix has to
+        // compose on top of it instead of replacing it.
+        document.transformEntity(selected, by: PaintEntity.moveTransform(dx: 4, dy: -2))
+        let placed = try requireBounds(document, selected, .identity, "the moved doodle")
+        try expectInk(document, 26, 42, "the doodle where the earlier edit left it")
+
+        let centre = CGPoint(x: placed.midX, y: placed.midY)
+        let drag = PaintEntity.rotationTransform(by: 0.35, around: centre)
+            .concatenating(CGAffineTransform(translationX: 6, y: 3))
+        let previewBounds = try requireBounds(document, selected, drag, "the previewed drag")
+
+        // The backdrop a live drag paints under the entity really is the scene
+        // without it: the entity's own ink gone, everything else identical.
+        let full = try requireImage(document.cgImage, "the document image")
+        let backdropImage = try requireImage(
+            document.renderedImage(excludingEntity: selected),
+            "the scene without the selected entity"
+        )
+        let backdrop = try raster(backdropImage)
+        let composite = try raster(full)
+        try expectImagePixel(
+            backdrop,
+            26,
+            document.pixelHeight - 1 - 42,
+            .white,
+            "the selected entity must be absent from the backdrop"
+        )
+        try expectImagePixel(
+            backdrop,
+            18,
+            document.pixelHeight - 1 - 6,
+            .black,
+            "the entity below must still draw into the backdrop"
+        )
+        try expectEqual(
+            try rasterDifference(backdrop, composite, ignoring: placed).differing,
+            0,
+            "pixels outside the excluded entity's own bounds"
+        )
+        try expect(
+            try rasterDifference(backdrop, composite).differing > 0,
+            "excluding the selected entity must actually remove its ink"
+        )
+        let everything = try raster(
+            try requireImage(
+                document.renderedImage(excludingEntity: nil),
+                "the scene with every entity"
+            )
+        )
+        try expectEqual(
+            try rasterDifference(everything, composite).differing,
+            0,
+            "pixels where renderedImage(excludingEntity: nil) differs from the document image"
+        )
+        let strangerExcluded = try raster(
+            try requireImage(
+                document.renderedImage(excludingEntity: UUID()),
+                "the scene excluding an unknown entity"
+            )
+        )
+        try expectEqual(
+            try rasterDifference(strangerExcluded, composite).differing,
+            0,
+            "pixels an unknown identifier excluded"
+        )
+
+        // What the canvas paints during the drag...
+        let context = try canvasContext(document.pixelWidth, document.pixelHeight)
+        context.draw(
+            backdropImage,
+            in: CGRect(x: 0, y: 0, width: document.pixelWidth, height: document.pixelHeight)
+        )
+        document.drawEntity(selected, in: context, applying: drag)
+        let preview = try raster(try requireImage(context.makeImage(), "the drag preview"))
+
+        // ...and what the model commits when the mouse comes up.
+        document.transformEntity(selected, by: drag)
+        let committedBounds = try requireBounds(
+            document,
+            selected,
+            .identity,
+            "the committed bounds"
+        )
+        try expect(
+            nearlyEqual(committedBounds, previewBounds, 1e-6),
+            "the commit must land exactly where the preview showed: got \(committedBounds), "
+                + "previewed \(previewBounds)"
+        )
+        let committed = try raster(try requireImage(document.cgImage, "the committed image"))
+        let drift = try rasterDifference(preview, committed, slack: 4)
+        let pixels = preview.width * preview.height
+        try expect(
+            drift.differing * 500 <= pixels,
+            "the preview and the commit must compose to the same pixels: \(drift.differing) "
+                + "of \(pixels) differ (worst channel \(drift.worst))"
+        )
+    }
+
+    /// Delete removes exactly one entity, as one undo entry, and leaves behind
+    /// exactly the scene the drag backdrop already showed.
+    private func entityDelete() throws {
+        let fixture = try entityFixture()
+        let document = fixture.document
+        let ids = fixture.ids
+        let doomed = ids[2]
+        let remaining = [ids[0], ids[1], ids[3]]
+
+        try expectInk(document, 18, 48, "the doodle's ink before the delete")
+        let backdrop = try raster(
+            try requireImage(
+                document.renderedImage(excludingEntity: doomed),
+                "the scene without the doodle"
+            )
+        )
+
+        let revision = document.revision
+        document.deleteEntity(doomed)
+        try expect(document.revision > revision, "deleting an entity must bump revision")
+        try expect(
+            document.selectableEntityIDs == remaining,
+            "delete must remove exactly one entity and keep the rest in z-order"
+        )
+        try expect(
+            document.entityBounds(doomed, applying: .identity) == nil,
+            "a deleted entity has no bounds"
+        )
+        try expect(try isPage(document, 18, 48), "the deleted entity's ink is gone")
+        try expectNoEntity(
+            document,
+            at: CGPoint(x: 18, y: 48),
+            tolerance: 2,
+            "the deleted entity"
+        )
+        try expectInk(document, 20, 8, "the entity below survives the delete")
+        let after = try raster(try requireImage(document.cgImage, "the image after the delete"))
+        try expectEqual(
+            try rasterDifference(backdrop, after).differing,
+            0,
+            "pixels where a delete differs from the preview backdrop that predicted it"
+        )
+
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == ids,
+            "one undo must restore the deleted entity, identifier and z-order included"
+        )
+        try expectInk(document, 18, 48, "the deleted ink is back")
+        document.redo()
+        try expect(
+            document.selectableEntityIDs == remaining,
+            "redo must remove the same entity again"
+        )
+
+        // One checkpoint each, and the canvas empties out.
+        for id in remaining {
+            document.deleteEntity(id)
+        }
+        try expect(document.selectableEntityIDs.isEmpty, "every entity deleted")
+        try expect(try isPage(document, 20, 8), "the canvas is blank once every entity is gone")
+        document.undo()
+        document.undo()
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == remaining,
+            "three undos must reverse exactly the three deletes"
+        )
+    }
+
+    /// Requests that cannot change anything change neither the entities, the
+    /// pixels nor the history.
+    private func entityNoOps() throws {
+        let fixture = try entityFixture()
+        let document = fixture.document
+        let ids = fixture.ids
+        let id = ids[0]
+        let bounds = try requireBounds(document, id, .identity, "the rectangle's bounds")
+        let revision = document.revision
+
+        let rejected: [CGAffineTransform] = [
+            .identity,
+            CGAffineTransform(translationX: 0, y: 0),
+            CGAffineTransform(scaleX: 0, y: 1),
+            CGAffineTransform(scaleX: 1, y: 0),
+            CGAffineTransform(a: 2, b: 1, c: 4, d: 2, tx: 0, ty: 0),
+            CGAffineTransform(translationX: .nan, y: 4),
+            CGAffineTransform(a: .infinity, b: 0, c: 0, d: 1, tx: 0, ty: 0),
+        ]
+        for transform in rejected {
+            document.transformEntity(id, by: transform)
+            try expectEqual(
+                document.revision,
+                revision,
+                "revision after transformEntity(by: \(transform))"
+            )
+            try expectFlags(document, undo: true, redo: false, dirty: true)
+            let unchanged = try requireBounds(document, id, .identity, "the bounds")
+            try expect(
+                nearlyEqual(unchanged, bounds, 1e-9),
+                "transformEntity(by: \(transform)) must change nothing, bounds became \(unchanged)"
+            )
+        }
+
+        // Unknown identifiers are not errors, they are nothing.
+        let stranger = UUID()
+        document.transformEntity(stranger, by: PaintEntity.moveTransform(dx: 10, dy: 10))
+        document.deleteEntity(stranger)
+        try expectEqual(
+            document.revision,
+            revision,
+            "revision after operating on an unknown identifier"
+        )
+        try expect(
+            document.selectableEntityIDs == ids,
+            "an unknown identifier must change no entity"
+        )
+        try expect(
+            document.entityBounds(stranger, applying: .identity) == nil,
+            "an unknown identifier has no bounds"
+        )
+
+        let base = try requireImage(document.cgImage, "the document image")
+        let context = try canvasContext(document.pixelWidth, document.pixelHeight)
+        context.draw(
+            base,
+            in: CGRect(x: 0, y: 0, width: document.pixelWidth, height: document.pixelHeight)
+        )
+        document.drawEntity(stranger, in: context, applying: .identity)
+        let drawn = try raster(try requireImage(context.makeImage(), "the unchanged composite"))
+        try expectEqual(
+            try rasterDifference(try raster(base), drawn).differing,
+            0,
+            "pixels drawn for an unknown identifier"
+        )
+
+        // Four fixture checkpoints and nothing since, so none of the rejections
+        // left a half-open operation behind: one real edit plus five undos
+        // reaches the pristine document.
+        document.transformEntity(id, by: PaintEntity.moveTransform(dx: 6, dy: 6))
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        for _ in 0..<5 {
+            document.undo()
+        }
         try expectFlags(document, undo: false, redo: true, dirty: false)
-        try expectMarker(document, in: markerRect, "marker restored after the one committed move")
+        try expect(
+            document.selectableEntityIDs.isEmpty,
+            "unwinding every checkpoint must remove every entity"
+        )
     }
 
-    // MARK: Selection helpers
+    /// Flood fill, clear and a new document flatten or drop the entities; the
+    /// pixels they were made of survive where they should, and resizing keeps
+    /// the entities anchored exactly like the background.
+    private func entityFlattening() throws {
+        let document = PaintDocument(width: 40, height: 40)
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 6, y: 6),
+            to: CGPoint(x: 34, y: 34),
+            color: .black,
+            constrained: false
+        )
+        doodle(document, [CGPoint(x: 2.5, y: 36.5), CGPoint(x: 8.5, y: 38.5)])
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 2, "entities before the fill")
+        try expectInk(document, 20, 6, "the outline before the fill")
+        try expectEntity(
+            document,
+            at: CGPoint(x: 20, y: 6),
+            tolerance: 1,
+            ids[0],
+            "the outline before the fill"
+        )
 
-    /// A solid, axis-aligned block of a fixture bitmap, in bottom-left based
-    /// document pixels.
-    private struct Block {
-        let x: Int
-        let y: Int
-        let width: Int
-        let height: Int
-        let color: NSColor
+        // Filling flattens the composite into the background first, so the fill
+        // is bounded by the entities' own pixels and nothing stays selectable.
+        // Had the entities still been floating above the background, the fill
+        // would have flooded the whole page.
+        document.floodFill(at: CGPoint(x: 20, y: 20), color: .red)
+        try expect(document.selectableEntityIDs.isEmpty, "flood fill must flatten every entity")
+        try expectPixel(document, 20, 20, .red, "the filled interior")
+        try expectInk(document, 20, 6, "the flattened outline keeps its pixels")
+        try expectInk(document, 5, 37, "the flattened doodle keeps its pixels")
+        try expectPixel(document, 2, 2, .white, "the fill stopped at the flattened outline")
+        try expectNoEntity(
+            document,
+            at: CGPoint(x: 20, y: 6),
+            tolerance: 2,
+            "flattened pixels"
+        )
+
+        // One checkpoint, and the entities come back exactly as they were.
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == ids,
+            "undoing the fill must restore the same entities in the same order"
+        )
+        try expectPixel(document, 20, 20, .white, "the fill is undone")
+        try expectEntity(
+            document,
+            at: CGPoint(x: 20, y: 6),
+            tolerance: 1,
+            ids[0],
+            "the outline after undoing the fill"
+        )
+        document.redo()
+        try expect(document.selectableEntityIDs.isEmpty, "redoing the fill flattens again")
+        document.undo()
+
+        // Clearing the canvas takes the entities with it, as one checkpoint.
+        document.clear(color: .white)
+        try expect(document.selectableEntityIDs.isEmpty, "clear must remove every entity")
+        try expectPixel(document, 20, 6, .white, "clear wipes the entity pixels")
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == ids,
+            "undoing a clear must restore the entities"
+        )
+        try expectInk(document, 20, 6, "the outline is back after undoing the clear")
+
+        // A new document starts from nothing at all.
+        document.newDocument(width: 32, height: 24)
+        try expect(document.selectableEntityIDs.isEmpty, "newDocument must remove every entity")
+        try expectFlags(document, undo: false, redo: false, dirty: false)
+
+        // Resizing keeps the entities and anchors their content to the top-left
+        // exactly as it anchors the background pixels.
+        let resized = PaintDocument(width: 20, height: 20)
+        resized.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 4, y: 4),
+            to: CGPoint(x: 14, y: 14),
+            color: .black,
+            constrained: false
+        )
+        let resizedIDs = resized.selectableEntityIDs
+        try expectEqual(resizedIDs.count, 1, "one entity before the resize")
+        let box = try requireBounds(resized, resizedIDs[0], .identity, "the bounds before")
+        resized.resize(width: 20, height: 40, background: .red)
+        try expect(
+            resized.selectableEntityIDs == resizedIDs,
+            "resizing must keep the entities"
+        )
+        let anchored = try requireBounds(resized, resizedIDs[0], .identity, "the bounds after")
+        let expected = box.offsetBy(dx: 0, dy: 20)
+        try expect(
+            nearlyEqual(anchored, expected, 1e-6),
+            "entity content must stay anchored to the top-left like the background pixels: "
+                + "got \(anchored), expected \(expected)"
+        )
+        try expectInk(resized, 9, 24, "the entity's edge after the resize")
+        try expectPixel(resized, 2, 2, .red, "the new area takes the background colour")
+        resized.undo()
+        let unresized = try requireBounds(resized, resizedIDs[0], .identity, "the bounds restored")
+        try expect(
+            nearlyEqual(unresized, box, 1e-6),
+            "undoing the resize must restore the entity placement, got \(unresized)"
+        )
     }
 
-    /// Top-left based, unpremultiplied readback of a `CGImage`, so extracted
-    /// selection pixels can be inspected in the orientation the image itself
-    /// stores them.
+    /// Entities are part of what the app shows, samples and writes out: the
+    /// eyedropper, the rasterised image and the saved PNG all include them, and
+    /// opening a file starts over with pixels only.
+    private func entitiesInFiles() throws {
+        let ink = NSColor(srgbRed: 0.2, green: 0.4, blue: 0.6, alpha: 1)
+        let document = PaintDocument(width: 40, height: 30)
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 6, y: 8),
+            to: CGPoint(x: 34, y: 24),
+            color: ink,
+            constrained: false
+        )
+        doodle(
+            document,
+            [CGPoint(x: 4.5, y: 3.5), CGPoint(x: 16.5, y: 3.5)],
+            color: ink
+        )
+        try expectEqual(document.selectableEntityIDs.count, 2, "entities to save")
+
+        // Colour sampling reads the entity's own colour, not the background
+        // underneath it.
+        try expectPixel(document, 20, 7, ink, "the shape's colour under the eyedropper")
+        try expectPixel(document, 10, 3, ink, "the doodle's colour under the eyedropper")
+
+        // ...and so does the image the app draws and saves.
+        let image = try raster(try requireImage(document.cgImage, "the document image"))
+        try expectImagePixel(
+            image,
+            20,
+            document.pixelHeight - 1 - 7,
+            ink,
+            "the shape in the rasterised image"
+        )
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("paint-model-smoke-entities-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try document.savePNG(to: url)
+        try expectFlags(document, undo: true, redo: false, dirty: false)
+
+        try document.open(url: url)
+        try expectSize(document, 40, 30)
+        try expect(
+            document.selectableEntityIDs.isEmpty,
+            "opening a file must start with pixels and no entities"
+        )
+        try expectFlags(document, undo: false, redo: false, dirty: false)
+        try expectPixel(document, 20, 7, ink, "the saved file holds the shape's pixels")
+        try expectPixel(document, 10, 3, ink, "the saved file holds the doodle's pixels")
+        try expectNoEntity(
+            document,
+            at: CGPoint(x: 20, y: 7),
+            tolerance: 2,
+            "imported pixels"
+        )
+    }
+
+    // MARK: Entity helpers
+
+    /// Top-left based, unpremultiplied readback of a `CGImage`, so rendered
+    /// pixels can be inspected in the orientation the image itself stores them.
     private struct Raster {
         let width: Int
         let height: Int
@@ -2377,115 +3674,334 @@ final class ModelSmokeRun {
         }
     }
 
-    /// Every colour the selection scenarios paint with. Interpolated pixels —
-    /// anything scaled or rotated — are judged by which of these they are
-    /// closest to, which identifies the quadrant without pinning an exact
-    /// blend.
-    private var selectionPalette: [(color: NSColor, name: String)] {
-        [
-            (ModelSmokeRun.markerBottomLeft, "marker bottom-left"),
-            (ModelSmokeRun.markerBottomRight, "marker bottom-right"),
-            (ModelSmokeRun.markerTopRight, "marker top-right"),
-            (ModelSmokeRun.markerTopLeft, "marker top-left"),
-            (ModelSmokeRun.outsideMark, "outside mark"),
-            (ModelSmokeRun.selectionBackground, "selection background"),
-            (.white, "page white"),
-        ]
+    /// The four fixture entities on the shared canvas, in z-order.
+    private func entityFixture(
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> (document: PaintDocument, ids: [UUID]) {
+        let document = PaintDocument(width: entityCanvas.width, height: entityCanvas.height)
+        document.addShape(
+            tool: .rectangle,
+            from: fixtureRect.from,
+            to: fixtureRect.to,
+            color: .black,
+            constrained: false
+        )
+        document.addShape(
+            tool: .line,
+            from: fixtureLine.from,
+            to: fixtureLine.to,
+            color: .black,
+            constrained: false
+        )
+        doodle(document, fixtureDoodle)
+        document.addText(
+            fixtureText,
+            at: fixtureTextOrigin,
+            color: .black,
+            fontSize: fixtureFontSize
+        )
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 4, "entity fixture size", file: file, line: line)
+        return (document, ids)
     }
 
-    /// A document holding the asymmetric four-quadrant marker inside `rect`, an
-    /// unrelated black block outside it and white everywhere else.
+    /// One freehand transaction along `points`, exactly as a drag arrives:
+    /// begin, one segment per mouse move, end.
+    private func doodle(
+        _ document: PaintDocument,
+        _ points: [CGPoint],
+        tool: PaintTool = .pencil,
+        color: NSColor = .black
+    ) {
+        guard let first = points.first else { return }
+        document.beginStroke()
+        if points.count == 1 {
+            document.drawStroke(
+                from: first,
+                to: first,
+                tool: tool,
+                color: color,
+                secondaryColor: .white
+            )
+        }
+        var previous = first
+        for point in points.dropFirst() {
+            document.drawStroke(
+                from: previous,
+                to: point,
+                tool: tool,
+                color: color,
+                secondaryColor: .white
+            )
+            previous = point
+        }
+        document.endStroke()
+    }
+
+    /// The laid-out size of a text entity's glyphs, measured the same way the
+    /// entity measures itself, so text bounds can be predicted here.
+    private func textSize(_ value: String, _ fontSize: CGFloat) -> CGSize {
+        NSAttributedString(
+            string: value,
+            attributes: [.font: NSFont.systemFont(ofSize: max(1, fontSize))]
+        ).size()
+    }
+
+    /// Three deliberately asymmetric entities — a wide rectangle, a slanted
+    /// line and a bent pencil doodle — each alone on its own canvas.
     ///
-    /// Built as an image file and opened, so the fixture pixels are exact and
-    /// the document starts with empty history and a clean dirty flag: every
-    /// selection scenario can then count history entries from zero.
-    private func markerDocument(
-        rect: CGRect,
+    /// Asymmetry is the point: a square would hide an axis swap, and a frame
+    /// that quietly re-measured itself in world space would still look right on
+    /// something symmetric.
+    private func orientedFixtures(
         file: String = #fileID,
         line: UInt = #line
-    ) throws -> PaintDocument {
-        let originX = Int(rect.minX)
-        let originY = Int(rect.minY)
-        let halfWidth = Int(rect.width) / 2
-        let halfHeight = Int(rect.height) / 2
-        let blocks = [
-            Block(
-                x: originX,
-                y: originY,
-                width: halfWidth,
-                height: halfHeight,
-                color: ModelSmokeRun.markerBottomLeft
-            ),
-            Block(
-                x: originX + halfWidth,
-                y: originY,
-                width: halfWidth,
-                height: halfHeight,
-                color: ModelSmokeRun.markerBottomRight
-            ),
-            Block(
-                x: originX + halfWidth,
-                y: originY + halfHeight,
-                width: halfWidth,
-                height: halfHeight,
-                color: ModelSmokeRun.markerTopRight
-            ),
-            Block(
-                x: originX,
-                y: originY + halfHeight,
-                width: halfWidth,
-                height: halfHeight,
-                color: ModelSmokeRun.markerTopLeft
-            ),
-            Block(
-                x: Int(outsideRect.minX),
-                y: Int(outsideRect.minY),
-                width: Int(outsideRect.width),
-                height: Int(outsideRect.height),
-                color: ModelSmokeRun.outsideMark
-            ),
-        ]
+    ) throws -> [(label: String, document: PaintDocument, id: UUID)] {
+        var fixtures: [(label: String, document: PaintDocument, id: UUID)] = []
 
-        let document = try blockDocument(
-            width: selectionCanvas.width,
-            height: selectionCanvas.height,
-            blocks: blocks,
-            file: file,
-            line: line
+        let rectangle = PaintDocument(width: 260, height: 220)
+        rectangle.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 60, y: 80),
+            to: CGPoint(x: 160, y: 120),
+            color: .black,
+            constrained: false
         )
-        // The fixture must really be what the scenarios assume, otherwise their
-        // expectations could pass for the wrong reason.
-        try expectSize(
-            document,
-            selectionCanvas.width,
-            selectionCanvas.height,
-            file: file,
-            line: line
+        fixtures.append(
+            (
+                label: "the 100×40 rectangle",
+                document: rectangle,
+                id: try onlyEntity(rectangle, file: file, line: line)
+            )
         )
-        try expectFlags(document, undo: false, redo: false, dirty: false, file: file, line: line)
-        try expectMarker(document, in: rect, "fixture marker", file: file, line: line)
-        try expectPixel(
-            document,
-            Int(outsideRect.minX) + 1,
-            Int(outsideRect.minY) + 1,
-            ModelSmokeRun.outsideMark,
-            "fixture mark outside the selection",
-            file: file,
-            line: line
+
+        let slant = PaintDocument(width: 260, height: 220)
+        slant.addShape(
+            tool: .line,
+            from: CGPoint(x: 50, y: 50),
+            to: CGPoint(x: 170, y: 110),
+            color: .black,
+            constrained: false
         )
-        return document
+        fixtures.append(
+            (
+                label: "the slanted line",
+                document: slant,
+                id: try onlyEntity(slant, file: file, line: line)
+            )
+        )
+
+        let bent = PaintDocument(width: 260, height: 220)
+        doodle(
+            bent,
+            [
+                CGPoint(x: 50.5, y: 60.5),
+                CGPoint(x: 100.5, y: 90.5),
+                CGPoint(x: 150.5, y: 70.5),
+                CGPoint(x: 170.5, y: 120.5),
+            ]
+        )
+        fixtures.append(
+            (
+                label: "the bent doodle",
+                document: bent,
+                id: try onlyEntity(bent, file: file, line: line)
+            )
+        )
+
+        return fixtures
     }
 
-    /// Writes `blocks` into a white bitmap, then opens it as a document. TIFF
-    /// is lossless, so the document holds exactly these pixels, and `open`
-    /// leaves it with no history and no unsaved changes.
-    private func blockDocument(
-        width: Int,
-        height: Int,
-        blocks: [Block],
+    private func onlyEntity(
+        _ document: PaintDocument,
         file: String = #fileID,
         line: UInt = #line
-    ) throws -> PaintDocument {
+    ) throws -> UUID {
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 1, "entities on a single-entity fixture", file: file, line: line)
+        guard let id = ids.first else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "the fixture holds no selectable entity",
+                file: file,
+                line: line
+            )
+        }
+        return id
+    }
+
+    /// The local half of a selection: the entity's own untransformed ink
+    /// rectangle, which an oriented frame is built from.
+    private func requireLocalBounds(
+        _ document: PaintDocument,
+        _ id: UUID,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> CGRect {
+        guard let bounds = document.entityLocalBounds(id) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "\(label): entityLocalBounds returned nil",
+                file: file,
+                line: line
+            )
+        }
+        return bounds
+    }
+
+    /// The matrix half of a selection.
+    private func requireTransform(
+        _ document: PaintDocument,
+        _ id: UUID,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> CGAffineTransform {
+        guard let transform = document.entityTransform(id) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "\(label): entityTransform returned nil",
+                file: file,
+                line: line
+            )
+        }
+        return transform
+    }
+
+    /// Ink measured under exactly `absolute`, which is what a replacement edit
+    /// previews with.
+    private func requireBounds(
+        _ document: PaintDocument,
+        _ id: UUID,
+        using absolute: CGAffineTransform,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> CGRect {
+        guard let bounds = document.entityBounds(id, using: absolute) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "\(label): entityBounds(using: \(absolute)) returned nil",
+                file: file,
+                line: line
+            )
+        }
+        return bounds
+    }
+
+    private func requireBounds(
+        _ document: PaintDocument,
+        _ id: UUID,
+        _ additional: CGAffineTransform,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> CGRect {
+        guard let bounds = document.entityBounds(id, applying: additional) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "\(label): entityBounds(applying: \(additional)) returned nil",
+                file: file,
+                line: line
+            )
+        }
+        return bounds
+    }
+
+    private func expectBounds(
+        _ document: PaintDocument,
+        _ id: UUID,
+        _ expected: CGRect,
+        _ label: String,
+        epsilon: CGFloat = 1e-3,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws {
+        let actual = try requireBounds(document, id, .identity, label, file: file, line: line)
+        try expect(
+            nearlyEqual(actual, expected, epsilon),
+            "\(label): got \(actual), expected \(expected)",
+            file: file,
+            line: line
+        )
+    }
+
+    private func expectEntity(
+        _ document: PaintDocument,
+        at point: CGPoint,
+        tolerance: CGFloat,
+        _ expected: UUID,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws {
+        let picked = document.entityID(at: point, tolerance: tolerance)
+        try expect(
+            picked == expected,
+            "\(label): clicking \(point) with tolerance \(tolerance) selected "
+                + "\(picked.map(\.uuidString) ?? "nothing"), expected \(expected.uuidString)",
+            file: file,
+            line: line
+        )
+    }
+
+    private func expectNoEntity(
+        _ document: PaintDocument,
+        at point: CGPoint,
+        tolerance: CGFloat,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws {
+        let picked = document.entityID(at: point, tolerance: tolerance)
+        try expect(
+            picked == nil,
+            "\(label): clicking \(point) with tolerance \(tolerance) must select nothing, "
+                + "selected \(picked.map(\.uuidString) ?? "nothing")",
+            file: file,
+            line: line
+        )
+    }
+
+    /// True when the pixel is untouched page white.
+    private func isPage(
+        _ document: PaintDocument,
+        _ x: Int,
+        _ y: Int,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> Bool {
+        let sample = try pixel(document, x, y, file: file, line: line)
+        return sample.r >= 0.99 && sample.g >= 0.99 && sample.b >= 0.99 && sample.a >= 0.99
+    }
+
+    private func requireImage(
+        _ image: CGImage?,
+        _ label: String,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> CGImage {
+        guard let image else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "\(label): no image was produced",
+                file: file,
+                line: line
+            )
+        }
+        return image
+    }
+
+    /// A bitmap context laid out exactly like the document's own, so a preview
+    /// composed here is comparable to the committed pixels byte for byte.
+    private func canvasContext(
+        _ width: Int,
+        _ height: Int,
+        file: String = #fileID,
+        line: UInt = #line
+    ) throws -> CGContext {
         let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         guard let context = CGContext(
             data: nil,
@@ -2498,140 +4014,94 @@ final class ModelSmokeRun {
         ) else {
             throw SmokeFailure(
                 scenario: scenario,
-                message: "could not allocate a \(width)×\(height) fixture bitmap",
+                message: "could not allocate a \(width)×\(height) readback context",
                 file: file,
                 line: line
             )
         }
-
-        context.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        for block in blocks {
-            let want = try srgbComponents(block.color, file: file, line: line)
-            context.setFillColor(
-                CGColor(
-                    srgbRed: CGFloat(want.r),
-                    green: CGFloat(want.g),
-                    blue: CGFloat(want.b),
-                    alpha: CGFloat(want.a)
-                )
-            )
-            context.fill(
-                CGRect(x: block.x, y: block.y, width: block.width, height: block.height)
-            )
-        }
-
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("paint-model-smoke-selection-\(UUID().uuidString).tiff")
-        defer { try? FileManager.default.removeItem(at: url) }
-        guard let image = context.makeImage(),
-              let destination = CGImageDestinationCreateWithURL(
-                  url as CFURL,
-                  "public.tiff" as CFString,
-                  1,
-                  nil
-              )
-        else {
-            throw SmokeFailure(
-                scenario: scenario,
-                message: "could not create the selection fixture at \(url.path)",
-                file: file,
-                line: line
-            )
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw SmokeFailure(
-                scenario: scenario,
-                message: "could not finalise the selection fixture at \(url.path)",
-                file: file,
-                line: line
-            )
-        }
-
-        let document = PaintDocument(width: width, height: height)
-        try document.open(url: url)
-        return document
+        context.setShouldAntialias(true)
+        context.setAllowsAntialiasing(true)
+        context.setShouldSmoothFonts(true)
+        context.interpolationQuality = .high
+        return context
     }
 
-    /// The marker's oriented fingerprint inside `rect`: the four quadrant
-    /// colours, sampled at the quadrant centres.
-    ///
-    /// `quarterTurns` counts counterclockwise quarter turns of the content, so
-    /// a rotated selection is described by the same four colours in a shifted
-    /// order. `exact` compares colours outright — right for whole-pixel moves —
-    /// while a scaled or rotated marker is identified by proximity instead.
-    private func expectMarker(
-        _ document: PaintDocument,
-        in rect: CGRect,
-        _ label: String,
-        rotatedBy quarterTurns: Int = 0,
-        exact: Bool = true,
+    /// Whole-image readback: one draw into a known layout, then plain byte
+    /// access, so per-pixel checks do not re-rasterise the image.
+    private func raster(
+        _ image: CGImage,
         file: String = #fileID,
         line: UInt = #line
-    ) throws {
-        let colors = [
-            ModelSmokeRun.markerBottomLeft,
-            ModelSmokeRun.markerBottomRight,
-            ModelSmokeRun.markerTopRight,
-            ModelSmokeRun.markerTopLeft,
-        ]
-        let corners = ["bottom-left", "bottom-right", "top-right", "top-left"]
-        let centres = [
-            CGPoint(x: rect.minX + rect.width / 4, y: rect.minY + rect.height / 4),
-            CGPoint(x: rect.maxX - rect.width / 4, y: rect.minY + rect.height / 4),
-            CGPoint(x: rect.maxX - rect.width / 4, y: rect.maxY - rect.height / 4),
-            CGPoint(x: rect.minX + rect.width / 4, y: rect.maxY - rect.height / 4),
-        ]
-        let turns = ((quarterTurns % 4) + 4) % 4
-
-        for index in centres.indices {
-            let x = Int(centres[index].x.rounded(.down))
-            let y = Int(centres[index].y.rounded(.down))
-            let expected = colors[(index - turns + 4) % 4]
-            let corner = "\(label): \(corners[index]) quadrant"
-            if exact {
-                try expectPixel(document, x, y, expected, corner, file: file, line: line)
-            } else {
-                try expectNearestColor(document, x, y, expected, corner, file: file, line: line)
-            }
+    ) throws -> Raster {
+        let context = try canvasContext(image.width, image.height, file: file, line: line)
+        guard let base = context.data else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not read back a \(image.width)×\(image.height) image",
+                file: file,
+                line: line
+            )
         }
+        context.draw(
+            image,
+            in: CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        )
+        let byteCount = context.bytesPerRow * image.height
+        let bytes = [UInt8](
+            UnsafeBufferPointer(
+                start: base.assumingMemoryBound(to: UInt8.self),
+                count: byteCount
+            )
+        )
+        return Raster(
+            width: image.width,
+            height: image.height,
+            bytesPerRow: context.bytesPerRow,
+            bytes: bytes
+        )
     }
 
-    /// Asserts the pixel is closer to `expected` than to any other colour the
-    /// selection scenarios paint with. Used where interpolation legitimately
-    /// blends edges, so the quadrant is still identified while a flip, a wrong
-    /// scale or a rotation the wrong way round still fails.
-    private func expectNearestColor(
-        _ document: PaintDocument,
-        _ x: Int,
-        _ y: Int,
-        _ expected: NSColor,
-        _ label: String,
+    /// How far two same-sized rasters disagree: the number of pixels whose
+    /// channels differ by more than `slack`, and the worst single-channel
+    /// difference. `ignored` names a document-space rectangle to skip, widened
+    /// by a pixel so an antialiased fringe along its edge does not count.
+    private func rasterDifference(
+        _ lhs: Raster,
+        _ rhs: Raster,
+        ignoring ignored: CGRect = .null,
+        slack: Int = 2,
         file: String = #fileID,
         line: UInt = #line
-    ) throws {
-        let actual = try pixel(document, x, y, file: file, line: line)
-        let want = try srgbComponents(expected, file: file, line: line)
-        let expectedDistance = colorDistance(actual, want)
-
-        var nearest = (name: "", distance: Double.infinity)
-        for entry in selectionPalette {
-            let candidate = try srgbComponents(entry.color, file: file, line: line)
-            let distance = colorDistance(actual, candidate)
-            if distance < nearest.distance {
-                nearest = (entry.name, distance)
-            }
-        }
-
+    ) throws -> (differing: Int, worst: Int) {
         try expect(
-            expectedDistance <= nearest.distance + 1e-9,
-            "\(label) at (\(x), \(y)): \(format(actual)) is nearest \(nearest.name) "
-                + "(\(fixed(nearest.distance))), expected \(format(want)) "
-                + "(\(fixed(expectedDistance)))",
+            lhs.width == rhs.width && lhs.height == rhs.height,
+            "raster sizes differ: \(lhs.width)×\(lhs.height) vs \(rhs.width)×\(rhs.height)",
             file: file,
             line: line
         )
+        let skip = ignored.isNull ? ignored : ignored.insetBy(dx: -1, dy: -1)
+        var differing = 0
+        var worst = 0
+        for row in 0..<lhs.height {
+            // Raster rows count down from the top; document pixels count up.
+            let y = Double(lhs.height - 1 - row) + 0.5
+            let leftBase = row * lhs.bytesPerRow
+            let rightBase = row * rhs.bytesPerRow
+            for column in 0..<lhs.width {
+                if skip.contains(CGPoint(x: Double(column) + 0.5, y: y)) { continue }
+                var pixelDiffers = false
+                for channel in 0..<4 {
+                    let difference = abs(
+                        Int(lhs.bytes[leftBase + column * 4 + channel])
+                            - Int(rhs.bytes[rightBase + column * 4 + channel])
+                    )
+                    worst = max(worst, difference)
+                    if difference > slack { pixelDiffers = true }
+                }
+                if pixelDiffers { differing += 1 }
+            }
+        }
+        return (differing, worst)
     }
 
     private func expectImagePixel(
@@ -2658,79 +4128,6 @@ final class ModelSmokeRun {
         )
     }
 
-    /// True when the pixel is untouched page white.
-    private func isPage(
-        _ document: PaintDocument,
-        _ x: Int,
-        _ y: Int,
-        file: String = #fileID,
-        line: UInt = #line
-    ) throws -> Bool {
-        let sample = try pixel(document, x, y, file: file, line: line)
-        return sample.r >= 0.99 && sample.g >= 0.99 && sample.b >= 0.99 && sample.a >= 0.99
-    }
-
-    private func requireSelection(
-        _ document: PaintDocument,
-        _ rect: CGRect,
-        _ label: String,
-        file: String = #fileID,
-        line: UInt = #line
-    ) throws -> CGImage {
-        guard let image = document.selectionImage(in: rect) else {
-            throw SmokeFailure(
-                scenario: scenario,
-                message: "\(label): selectionImage(in: \(rect)) returned nil",
-                file: file,
-                line: line
-            )
-        }
-        return image
-    }
-
-    /// Whole-image readback: one draw into a known layout, then plain byte
-    /// access, so per-pixel checks do not re-rasterise the image.
-    private func raster(
-        _ image: CGImage,
-        file: String = #fileID,
-        line: UInt = #line
-    ) throws -> Raster {
-        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        guard let context = CGContext(
-            data: nil,
-            width: image.width,
-            height: image.height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: space,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ), let base = context.data else {
-            throw SmokeFailure(
-                scenario: scenario,
-                message: "could not read back a \(image.width)×\(image.height) selection",
-                file: file,
-                line: line
-            )
-        }
-        context.draw(
-            image,
-            in: CGRect(x: 0, y: 0, width: image.width, height: image.height)
-        )
-        let byteCount = context.bytesPerRow * image.height
-        let bytes = [UInt8](
-            UnsafeBufferPointer(
-                start: base.assumingMemoryBound(to: UInt8.self),
-                count: byteCount
-            )
-        )
-        return Raster(
-            width: image.width,
-            height: image.height,
-            bytesPerRow: context.bytesPerRow,
-            bytes: bytes
-        )
-    }
-
     private func srgbComponents(
         _ color: NSColor,
         file: String = #fileID,
@@ -2750,13 +4147,6 @@ final class ModelSmokeRun {
             Double(srgb.blueComponent),
             Double(srgb.alphaComponent)
         )
-    }
-
-    private func colorDistance(_ lhs: Pixel, _ rhs: Pixel) -> Double {
-        let red = lhs.r - rhs.r
-        let green = lhs.g - rhs.g
-        let blue = lhs.b - rhs.b
-        return (red * red + green * green + blue * blue).squareRoot()
     }
 
     // MARK: Shape helpers

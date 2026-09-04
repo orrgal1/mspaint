@@ -79,16 +79,24 @@ private final class PixelBuffer {
     }
 }
 
-/// A raw pixel snapshot used for undo/redo. Stores dimensions so history can
-/// cross canvas resizes, and the logical state identifier so dirty tracking
-/// survives time travel.
+/// One undo/redo state: the raw background pixels plus the entity list drawn on
+/// top of them. Dimensions are stored so history can cross canvas resizes, and
+/// the logical state identifier so dirty tracking survives time travel.
+///
+/// Entities are value types whose point arrays are copy-on-write, so a snapshot
+/// that leaves them untouched shares their storage with the live document and
+/// costs nothing beyond the array spine.
 private struct PaintSnapshot {
     let width: Int
     let height: Int
     let bytesPerRow: Int
     let bytes: [UInt8]
+    let entities: [PaintEntity]
     let stateID: Int
 
+    /// Only the bitmap counts against the history budget: entity storage is
+    /// shared between snapshots, so charging for it on every state would trim
+    /// history far more aggressively than the real memory use warrants.
     var byteCount: Int { bytes.count }
 }
 
@@ -96,7 +104,7 @@ private struct PaintSnapshot {
 final class PaintDocument: ObservableObject {
     // MARK: Published state
 
-    /// Bumped on every visible pixel change; views observe this to redraw.
+    /// Bumped on every visible change; views observe this to redraw.
     @Published private(set) var revision: Int = 0
     @Published private(set) var canvasSize: CGSize = .zero
     @Published private(set) var isDirty: Bool = false
@@ -114,7 +122,15 @@ final class PaintDocument: ObservableObject {
 
     // MARK: Storage
 
+    /// The opaque background: imported images, flood fill results and the
+    /// canvas colour. Everything the toolbox draws afterwards lives in
+    /// `entities` and is composited over this on demand.
     private var buffer: PixelBuffer
+    /// Retained drawings in back-to-front paint order.
+    private var entities: [PaintEntity] = []
+    /// The stroke entity an open freehand drag is still growing.
+    private var pendingStrokeID: UUID?
+
     private var undoStack: [PaintSnapshot] = []
     private var redoStack: [PaintSnapshot] = []
     private var historyBytes: Int = 0
@@ -122,10 +138,17 @@ final class PaintDocument: ObservableObject {
     /// Snapshot captured by `beginStroke()`, held for the whole drag so drag
     /// segments never copy the bitmap.
     private var pendingSnapshot: PaintSnapshot?
-    private var pendingDidPaint = false
 
+    /// Scratch bitmap the composite is rendered into. Reused across revisions;
+    /// reallocated only when the canvas changes size.
+    private var scratch: PixelBuffer?
+
+    private var cachedBackground: CGImage?
     private var cachedImage: CGImage?
     private var cachedImageRevision: Int = -1
+    private var cachedExcludedImage: CGImage?
+    private var cachedExcludedID: UUID?
+    private var cachedExcludedRevision: Int = -1
 
     private var stateID: Int = 0
     private var nextStateID: Int = 1
@@ -146,15 +169,30 @@ final class PaintDocument: ObservableObject {
 
     // MARK: Image access
 
-    /// Immutable image for the current revision. Built once per revision, so a
-    /// drag that emits many segments produces one copy per painted frame.
+    /// Immutable composite — background plus every entity — for the current
+    /// revision. Built once per revision, so a drag that emits many segments
+    /// produces one copy per painted frame.
     var cgImage: CGImage? {
-        if let cachedImage, cachedImageRevision == revision {
-            return cachedImage
+        renderedImage(excludingEntity: nil)
+    }
+
+    /// The composite with one entity left out, which is what the canvas draws
+    /// under a live selection drag. Passing `nil` yields the full composite.
+    func renderedImage(excludingEntity id: UUID?) -> CGImage? {
+        guard let id else {
+            if let cachedImage, cachedImageRevision == revision { return cachedImage }
+            let image = composite(excluding: nil)
+            cachedImage = image
+            cachedImageRevision = revision
+            return image
         }
-        let image = buffer.context.makeImage()
-        cachedImage = image
-        cachedImageRevision = revision
+        if let cachedExcludedImage, cachedExcludedRevision == revision, cachedExcludedID == id {
+            return cachedExcludedImage
+        }
+        let image = composite(excluding: id)
+        cachedExcludedImage = image
+        cachedExcludedID = id
+        cachedExcludedRevision = revision
         return image
     }
 
@@ -164,15 +202,18 @@ final class PaintDocument: ObservableObject {
     // MARK: Freehand strokes
 
     /// Opens a stroke transaction. Exactly one snapshot is taken here; the
-    /// individual drag segments are pure drawing.
+    /// individual drag segments only grow the stroke entity.
     func beginStroke() {
         if pendingSnapshot != nil {
             cancelStroke()
         }
         pendingSnapshot = makeSnapshot()
-        pendingDidPaint = false
+        pendingStrokeID = nil
     }
 
+    /// Extends the open stroke by one segment. The first segment of a drag
+    /// creates the entity; every later one appends a point to it, so the whole
+    /// gesture becomes a single selectable stroke.
     func drawStroke(
         from start: CGPoint,
         to end: CGPoint,
@@ -181,83 +222,68 @@ final class PaintDocument: ObservableObject {
         secondaryColor: NSColor
     ) {
         let paint: NSColor
-        let cap: CGLineCap
 
         switch tool {
         case .pencil, .brush, .thickBrush:
             paint = color
-            cap = .round
         case .eraser:
+            // Erasing lays down the canvas colour as an unselectable stroke.
             paint = secondaryColor
-            cap = .square
         default:
             // Not freehand tools: they commit through their own entry points.
             return
         }
 
-        let width = tool.strokeWidth
-
-        let context = buffer.context
-        context.saveGState()
-        context.setShouldAntialias(true)
-        context.setStrokeColor(PaintDocument.cgColor(paint))
-        context.setFillColor(PaintDocument.cgColor(paint))
-        context.setLineWidth(width)
-        context.setLineCap(cap)
-        context.setLineJoin(.round)
-
         let from = clampToCanvas(start)
         let to = clampToCanvas(end)
-        if hypot(to.x - from.x, to.y - from.y) < 0.01 {
-            // A single click still deposits one dab.
-            let dab = CGRect(
-                x: to.x - width / 2,
-                y: to.y - width / 2,
-                width: width,
-                height: width
-            )
-            if cap == .square {
-                context.fill(dab)
-            } else {
-                context.fillEllipse(in: dab)
-            }
-        } else {
-            context.beginPath()
-            context.move(to: from)
-            context.addLine(to: to)
-            context.strokePath()
-        }
-        context.restoreGState()
 
-        pendingDidPaint = true
+        if let index = pendingStrokeIndex() {
+            entities[index].appendStrokePoint(to)
+        } else {
+            var entity = PaintEntity(
+                content: .stroke(tool: tool, points: [from], color: paint)
+            )
+            // A click that never moves stays a one-point stroke, which renders
+            // and hit tests as a single dab.
+            if hypot(to.x - from.x, to.y - from.y) >= 0.01 {
+                entity.appendStrokePoint(to)
+            }
+            pendingStrokeID = entity.id
+            entities.append(entity)
+        }
+
         didMutate()
     }
 
     /// Commits the open transaction as a single undo checkpoint. A stroke that
-    /// painted nothing leaves no history entry.
+    /// drew nothing leaves no history entry.
     func endStroke() {
         guard let snapshot = pendingSnapshot else { return }
         pendingSnapshot = nil
-        guard pendingDidPaint else {
-            pendingDidPaint = false
-            return
-        }
-        pendingDidPaint = false
+        guard pendingStrokeID != nil else { return }
+        pendingStrokeID = nil
         pushUndo(snapshot)
         markMutated()
     }
 
-    /// Aborts the open transaction, restoring the pixels captured by
+    /// Aborts the open transaction, dropping the stroke entity captured by
     /// `beginStroke()` without recording history.
     func cancelStroke() {
         guard let snapshot = pendingSnapshot else { return }
         pendingSnapshot = nil
-        let didPaint = pendingDidPaint
-        pendingDidPaint = false
-        guard didPaint else { return }
+        guard pendingStrokeID != nil else { return }
+        pendingStrokeID = nil
         restore(snapshot)
-        didMutate()
+        didMutateBackground()
         refreshFlags()
+    }
+
+    /// The pending stroke is the entity most recently appended, so the common
+    /// case is a direct index instead of a search.
+    private func pendingStrokeIndex() -> Int? {
+        guard let id = pendingStrokeID else { return nil }
+        if let last = entities.last, last.id == id { return entities.count - 1 }
+        return entities.firstIndex { $0.id == id }
     }
 
     // MARK: Shapes
@@ -272,26 +298,23 @@ final class PaintDocument: ObservableObject {
         guard tool.isShape else { return }
 
         let from = clampToCanvas(start)
-        let to = clampToCanvas(end)
-        guard let path = PaintShapeGeometry.path(
+        let dragged = clampToCanvas(end)
+        // The Shift rule is resolved once, here: the entity stores the final
+        // endpoints so later edits never re-snap the shape.
+        let to = constrained
+            ? PaintShapeGeometry.constrainedEnd(tool: tool, from: from, to: dragged)
+            : dragged
+        guard PaintShapeGeometry.path(
             tool: tool,
             from: from,
             to: to,
-            constrained: constrained
-        ) else { return }
+            constrained: false
+        ) != nil else { return }
 
         let snapshot = makeSnapshot()
-        let context = buffer.context
-        context.saveGState()
-        context.setShouldAntialias(true)
-        context.setStrokeColor(PaintDocument.cgColor(color))
-        context.setLineWidth(tool.strokeWidth)
-        context.setLineJoin(.miter)
-        context.setLineCap(tool == .line ? .round : .square)
-        context.addPath(path)
-        context.strokePath()
-        context.restoreGState()
-
+        entities.append(
+            PaintEntity(content: .shape(tool: tool, from: from, to: to, color: color))
+        )
         pushUndo(snapshot)
         didMutate()
         markMutated()
@@ -302,15 +325,27 @@ final class PaintDocument: ObservableObject {
     /// Scanline flood fill over the real RGBA bytes. Iterative (no recursion),
     /// bounds checked, and a no-op — with no history entry — when the click
     /// lands outside the canvas or the target already matches the fill colour.
+    ///
+    /// Filling is the one operation that cannot respect entities: it reasons
+    /// about pixels, so the current composite is flattened into the background
+    /// first and the entity list is cleared. Undo brings the entities back.
     func floodFill(at point: CGPoint, color: NSColor) {
         guard let seed = pixelCoordinate(point) else { return }
 
         let replacement = PaintDocument.components(of: color)
-        let target = readPixel(x: seed.x, y: seed.y)
-        guard !PaintDocument.matches(target, replacement, tolerance: PaintDocument.fillTolerance)
-        else { return }
-
         let snapshot = makeSnapshot()
+        flattenEntitiesIntoBackground()
+
+        let target = readPixel(buffer, x: seed.x, y: seed.y)
+        guard !PaintDocument.matches(target, replacement, tolerance: PaintDocument.fillTolerance)
+        else {
+            // Nothing to fill: undo the flatten so the click changed nothing.
+            if !snapshot.entities.isEmpty {
+                restore(snapshot)
+                didMutateBackground()
+            }
+            return
+        }
 
         let width = buffer.width
         let height = buffer.height
@@ -369,15 +404,30 @@ final class PaintDocument: ObservableObject {
         }
 
         pushUndo(snapshot)
-        didMutate()
+        didMutateBackground()
         markMutated()
+    }
+
+    /// Bakes every entity into the background bitmap and drops the entity list.
+    /// Records no history of its own: the caller owns the checkpoint.
+    private func flattenEntitiesIntoBackground() {
+        guard !entities.isEmpty else { return }
+        let context = buffer.context
+        for entity in entities {
+            entity.draw(in: context)
+        }
+        entities.removeAll(keepingCapacity: false)
+        pendingStrokeID = nil
+        cachedBackground = nil
     }
 
     // MARK: Eyedropper
 
+    /// Samples the composite, so picking from a shape, a doodle or a run of
+    /// text returns the colour the user can actually see.
     func color(at point: CGPoint) -> NSColor? {
         guard let pixel = pixelCoordinate(point) else { return nil }
-        let raw = readPixel(x: pixel.x, y: pixel.y)
+        let raw = readPixel(compositedBuffer(excluding: nil), x: pixel.x, y: pixel.y)
         let alpha = CGFloat(raw.3) / 255
         guard alpha > 0 else {
             return NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 0)
@@ -394,160 +444,213 @@ final class PaintDocument: ObservableObject {
     // MARK: Text
 
     func addText(_ string: String, at point: CGPoint, color: NSColor, fontSize: CGFloat) {
-        let text = string
-        guard !text.isEmpty else { return }
+        guard !string.isEmpty else { return }
 
         let snapshot = makeSnapshot()
-        let origin = clampToCanvas(point)
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: max(1, fontSize)),
-            .foregroundColor: color,
-        ]
-
-        NSGraphicsContext.saveGraphicsState()
-        let graphicsContext = NSGraphicsContext(cgContext: buffer.context, flipped: false)
-        NSGraphicsContext.current = graphicsContext
-        graphicsContext.shouldAntialias = true
-        NSAttributedString(string: text, attributes: attributes).draw(at: origin)
-        NSGraphicsContext.restoreGraphicsState()
-
-        pushUndo(snapshot)
-        didMutate()
-        markMutated()
-    }
-
-    // MARK: Selection
-
-    /// Opaque copy of the pixels covered by `rect`, or nil when the request
-    /// does not cover at least one whole pixel of the canvas. Read only: no
-    /// pixels change, no revision bump, no history entry.
-    func selectionImage(in rect: CGRect) -> CGImage? {
-        guard let area = pixelRect(rect), let image = cgImage else { return nil }
-        // `cropping` works in the image's top-left pixel space, our rectangles
-        // are bottom-left document space.
-        return image.cropping(
-            to: CGRect(
-                x: area.minX,
-                y: CGFloat(buffer.height) - area.maxY,
-                width: area.width,
-                height: area.height
+        entities.append(
+            PaintEntity(
+                content: .text(
+                    value: string,
+                    origin: clampToCanvas(point),
+                    color: color,
+                    fontSize: fontSize
+                )
             )
         )
+        pushUndo(snapshot)
+        didMutate()
+        markMutated()
     }
 
-    /// Moves, scales and rotates a previously captured selection as one
-    /// undoable operation: the source area is repainted with `background`,
-    /// then `image` is drawn into `destinationRect`, rotated counterclockwise
-    /// by `rotation` radians around that rectangle's centre and clipped by the
-    /// canvas. Requests that cannot change anything — degenerate rectangles,
-    /// or an unrotated selection put back exactly where it came from — leave
-    /// the document and its history untouched.
-    func transformSelection(
-        _ image: CGImage,
-        from sourceRect: CGRect,
-        to destinationRect: CGRect,
-        rotation: CGFloat,
-        background: NSColor
-    ) {
-        guard rotation.isFinite,
-              let source = PaintDocument.normalizedRect(sourceRect),
-              let destination = PaintDocument.normalizedRect(destinationRect),
-              destination.width > 0,
-              destination.height > 0
+    // MARK: Entities
+
+    /// Every entity a click can pick up, in back-to-front paint order. Eraser
+    /// strokes are deliberately absent: erasing is a mark on the drawing, not a
+    /// thing on it.
+    var selectableEntityIDs: [UUID] {
+        var ids: [UUID] = []
+        ids.reserveCapacity(entities.count)
+        for entity in entities where entity.isSelectable {
+            ids.append(entity.id)
+        }
+        return ids
+    }
+
+    /// Topmost selectable entity under `point`, or nil for empty canvas.
+    func entityID(at point: CGPoint, tolerance: CGFloat) -> UUID? {
+        guard point.x.isFinite, point.y.isFinite else { return nil }
+        let slack = tolerance.isFinite ? max(0, tolerance) : 0
+        for entity in entities.reversed() where entity.isSelectable {
+            if entity.hitTest(point, tolerance: slack) { return entity.id }
+        }
+        return nil
+    }
+
+    /// Whether `point` lands on one specific entity's ink, within `tolerance`
+    /// world-space slack. Selection asks this about the entity it already
+    /// holds, so a body drag follows the shape the user can see rather than
+    /// the axis-aligned box around it, and keeps its grip on a rotated entity
+    /// even when another one is stacked above. False for unknown entities.
+    func entityHitTest(_ id: UUID, at point: CGPoint, tolerance: CGFloat) -> Bool {
+        guard point.x.isFinite, point.y.isFinite, let entity = entity(with: id) else {
+            return false
+        }
+        return entity.hitTest(point, tolerance: tolerance.isFinite ? max(0, tolerance) : 0)
+    }
+
+    /// World-space bounds of an entity with `additional` applied on top of its
+    /// own transform — the live drag matrix during a transform, `.identity`
+    /// once it is committed. Nil for unknown entities and for ones that draw
+    /// nothing.
+    func entityBounds(_ id: UUID, applying additional: CGAffineTransform) -> CGRect? {
+        guard let entity = entity(with: id) else { return nil }
+        let bounds = entity.bounds(applying: additional)
+        guard !bounds.isNull, !bounds.isInfinite else { return nil }
+        return bounds
+    }
+
+    /// Tight bounds of the entity's ink in its own untransformed coordinates —
+    /// the rectangle the selection frame is built from, so the frame stays a
+    /// quadrilateral carried by the entity's matrix instead of an axis-aligned
+    /// box re-measured (and inflated) on every edit. Nil for unknown entities
+    /// and for ones that draw nothing.
+    func entityLocalBounds(_ id: UUID) -> CGRect? {
+        guard let entity = entity(with: id) else { return nil }
+        let bounds = entity.localBounds
+        guard !bounds.isNull, !bounds.isInfinite else { return nil }
+        return bounds
+    }
+
+    /// The entity's current matrix from local to document space. Selection
+    /// holds on to this so a drag can compose against the exact transform the
+    /// frame was drawn with. Nil for unknown entities.
+    func entityTransform(_ id: UUID) -> CGAffineTransform? {
+        entity(with: id)?.transform
+    }
+
+    /// World-space bounds the entity would occupy under `absolute` as its whole
+    /// transform, ignoring the one it currently carries. This is the query for
+    /// a candidate matrix a drag has already composed in full.
+    func entityBounds(_ id: UUID, using absolute: CGAffineTransform) -> CGRect? {
+        guard let entity = entity(with: id) else { return nil }
+        let bounds = entity.bounds(using: absolute)
+        guard !bounds.isNull, !bounds.isInfinite else { return nil }
+        return bounds
+    }
+
+    /// Draws one entity into an arbitrary context — the canvas uses this for
+    /// the transform preview, which never touches the model.
+    func drawEntity(_ id: UUID, in context: CGContext, applying additional: CGAffineTransform) {
+        guard let entity = entity(with: id) else { return }
+        entity.draw(in: context, applying: additional)
+    }
+
+    /// Draws one entity under `absolute` as its whole transform, replacing the
+    /// one it carries. The live preview of a resize or rotation hands over the
+    /// very matrix it will commit, so the pixels under the frame and the pixels
+    /// after the commit cannot disagree.
+    func drawEntity(_ id: UUID, in context: CGContext, using absolute: CGAffineTransform) {
+        guard let entity = entity(with: id) else { return }
+        entity.draw(in: context, using: absolute)
+    }
+
+    /// Commits a move, resize or rotation as exactly one undoable step.
+    /// Identity, non-finite and degenerate matrices change nothing and record
+    /// nothing, as do unknown identifiers.
+    func transformEntity(_ id: UUID, by additional: CGAffineTransform) {
+        guard !PaintEntity.isIdentity(additional),
+              PaintEntity.isInvertible(additional),
+              let index = entities.firstIndex(where: { $0.id == id })
         else { return }
 
-        let isUnrotated = abs(rotation) <= PaintDocument.rotationEpsilon
-        if isUnrotated, PaintDocument.sameRect(source, destination) { return }
-
-        let canvas = CGRect(x: 0, y: 0, width: buffer.width, height: buffer.height)
-        let clearArea = pixelRect(source)
-        // Nothing to vacate and nothing that lands on the canvas: no-op.
-        guard clearArea != nil || destination.intersects(canvas) else { return }
-
         let snapshot = makeSnapshot()
-        let context = buffer.context
-
-        if let clearArea {
-            context.saveGState()
-            context.setBlendMode(.copy)
-            context.setFillColor(PaintDocument.cgColor(background))
-            context.fill(clearArea)
-            context.restoreGState()
-        }
-
-        context.saveGState()
-        context.clip(to: canvas)
-        context.setShouldAntialias(true)
-        context.interpolationQuality = .high
-        if !isUnrotated {
-            // Positive angles turn counterclockwise in this bottom-left space.
-            context.translateBy(x: destination.midX, y: destination.midY)
-            context.rotate(by: rotation)
-            context.translateBy(x: -destination.midX, y: -destination.midY)
-        }
-        // `draw` puts image row 0 along the top edge, which is exactly how the
-        // crop in `selectionImage` was taken, so orientation survives.
-        context.draw(image, in: destination)
-        context.restoreGState()
-
+        entities[index].applyWorldTransform(additional)
         pushUndo(snapshot)
         didMutate()
         markMutated()
     }
 
-    /// Repaints the selected area with `background` as one undoable operation.
-    /// A selection that covers no whole pixel leaves no history entry.
-    func deleteSelection(in rect: CGRect, background: NSColor) {
-        guard let area = pixelRect(rect) else { return }
+    /// Replaces an entity's transform outright as exactly one undoable step.
+    ///
+    /// A drag composes its edit in the space it belongs in — world space for a
+    /// move or rotation, the entity's own local space for a resize — and hands
+    /// the finished matrix over here. Committing the result rather than an
+    /// extra world-space factor is what keeps a rotated shape's axes square:
+    /// nothing is ever re-derived from an axis-aligned box.
+    ///
+    /// Non-finite and degenerate matrices are rejected, and a replacement equal
+    /// to the transform already stored changes nothing, so neither leaves a
+    /// history entry.
+    func setEntityTransform(_ id: UUID, to absolute: CGAffineTransform) {
+        guard PaintEntity.isInvertible(absolute),
+              let index = entities.firstIndex(where: { $0.id == id }),
+              entities[index].transform != absolute
+        else { return }
 
         let snapshot = makeSnapshot()
-        let context = buffer.context
-        context.saveGState()
-        context.setBlendMode(.copy)
-        context.setFillColor(PaintDocument.cgColor(background))
-        context.fill(area)
-        context.restoreGState()
-
+        entities[index].transform = absolute
         pushUndo(snapshot)
         didMutate()
         markMutated()
+    }
+
+    /// Removes an entity as one undoable step. Unknown identifiers are no-ops.
+    func deleteEntity(_ id: UUID) {
+        guard let index = entities.firstIndex(where: { $0.id == id }) else { return }
+
+        let snapshot = makeSnapshot()
+        entities.remove(at: index)
+        if pendingStrokeID == id { pendingStrokeID = nil }
+        pushUndo(snapshot)
+        didMutate()
+        markMutated()
+    }
+
+    private func entity(with id: UUID) -> PaintEntity? {
+        for entity in entities where entity.id == id { return entity }
+        return nil
     }
 
     // MARK: Whole-canvas operations
 
     func clear(color: NSColor) {
         let snapshot = makeSnapshot()
+        entities.removeAll(keepingCapacity: false)
+        pendingStrokeID = nil
         fillEntireBitmap(with: color)
         pushUndo(snapshot)
-        didMutate()
         markMutated()
     }
 
-    /// Starts over: fresh white bitmap, empty history, clean state.
+    /// Starts over: fresh white bitmap, no entities, empty history, clean state.
     func newDocument(width: Int, height: Int) {
         let size = PaintDocument.clamp(width: width, height: height)
         if let replacement = PixelBuffer(width: size.width, height: size.height) {
             buffer = replacement
             canvasSize = CGSize(width: replacement.width, height: replacement.height)
         }
+        entities.removeAll(keepingCapacity: false)
         fillEntireBitmap(with: .white)
         resetHistory()
-        didMutate()
+        didMutateBackground()
         stateID = 0
         savedStateID = 0
         nextStateID = 1
         refreshFlags()
     }
 
-    /// Non-destructive resize: existing pixels are preserved anchored to the
-    /// top-left corner, new area is painted with `background`.
+    /// Non-destructive resize: existing content is preserved anchored to the
+    /// top-left corner, new area is painted with `background`. Entities travel
+    /// with the background — the canvas grows downward in this bottom-left
+    /// coordinate space, so they shift by the height difference — and are
+    /// clipped by the new canvas when drawn.
     func resize(width: Int, height: Int, background: NSColor) {
         let size = PaintDocument.clamp(width: width, height: height)
         guard size.width != buffer.width || size.height != buffer.height else { return }
         guard let replacement = PixelBuffer(width: size.width, height: size.height) else { return }
 
         let snapshot = makeSnapshot()
-        let existing = buffer.context.makeImage()
+        let existing = backgroundImage()
 
         replacement.context.saveGState()
         replacement.context.setFillColor(PaintDocument.cgColor(background))
@@ -567,10 +670,18 @@ final class PaintDocument: ObservableObject {
         }
         replacement.context.restoreGState()
 
+        let shift = CGFloat(replacement.height - buffer.height)
+        if shift != 0 {
+            let translation = PaintEntity.moveTransform(dx: 0, dy: shift)
+            for index in entities.indices {
+                entities[index].applyWorldTransform(translation)
+            }
+        }
+
         buffer = replacement
         canvasSize = CGSize(width: replacement.width, height: replacement.height)
         pushUndo(snapshot)
-        didMutate()
+        didMutateBackground()
         markMutated()
     }
 
@@ -600,8 +711,9 @@ final class PaintDocument: ObservableObject {
 
         buffer = replacement
         canvasSize = CGSize(width: replacement.width, height: replacement.height)
+        entities.removeAll(keepingCapacity: false)
         resetHistory()
-        didMutate()
+        didMutateBackground()
         stateID = 0
         savedStateID = 0
         nextStateID = 1
@@ -609,7 +721,7 @@ final class PaintDocument: ObservableObject {
     }
 
     func savePNG(to url: URL) throws {
-        guard let image = buffer.context.makeImage() else {
+        guard let image = cgImage else {
             throw PaintDocumentError.encodingFailed(url)
         }
         let rep = NSBitmapImageRep(cgImage: image)
@@ -728,7 +840,7 @@ final class PaintDocument: ObservableObject {
         redoStack.append(current)
         historyBytes += current.byteCount
         restore(snapshot)
-        didMutate()
+        didMutateBackground()
         refreshFlags()
     }
 
@@ -740,7 +852,7 @@ final class PaintDocument: ObservableObject {
         undoStack.append(current)
         historyBytes += current.byteCount
         restore(snapshot)
-        didMutate()
+        didMutateBackground()
         refreshFlags()
     }
 
@@ -771,7 +883,7 @@ final class PaintDocument: ObservableObject {
         redoStack.removeAll(keepingCapacity: false)
         historyBytes = 0
         pendingSnapshot = nil
-        pendingDidPaint = false
+        pendingStrokeID = nil
     }
 
     // MARK: Snapshots
@@ -782,6 +894,7 @@ final class PaintDocument: ObservableObject {
             height: buffer.height,
             bytesPerRow: buffer.bytesPerRow,
             bytes: [UInt8](UnsafeBufferPointer(start: buffer.bytes, count: buffer.byteCount)),
+            entities: entities,
             stateID: stateID
         )
     }
@@ -812,7 +925,60 @@ final class PaintDocument: ObservableObject {
             }
         }
 
+        entities = snapshot.entities
+        pendingStrokeID = nil
         stateID = snapshot.stateID
+    }
+
+    // MARK: Compositing
+
+    /// Background plus every entity except `excluded`, rendered into the shared
+    /// scratch bitmap. Returns the background buffer itself when there is
+    /// nothing to draw over it, so the common case allocates and copies nothing.
+    private func compositedBuffer(excluding excluded: UUID?) -> PixelBuffer {
+        guard entities.contains(where: { $0.id != excluded }), let target = scratchBuffer() else {
+            return buffer
+        }
+
+        let context = target.context
+        let canvas = CGRect(x: 0, y: 0, width: target.width, height: target.height)
+        context.saveGState()
+        context.setBlendMode(.copy)
+        if let background = backgroundImage() {
+            context.draw(background, in: canvas)
+        } else {
+            context.setFillColor(PaintDocument.cgColor(.white))
+            context.fill(canvas)
+        }
+        context.restoreGState()
+
+        for entity in entities where entity.id != excluded {
+            entity.draw(in: context)
+        }
+        return target
+    }
+
+    private func composite(excluding excluded: UUID?) -> CGImage? {
+        let source = compositedBuffer(excluding: excluded)
+        if source === buffer { return backgroundImage() }
+        return source.context.makeImage()
+    }
+
+    /// The background bitmap as an image, cached until the pixels change.
+    private func backgroundImage() -> CGImage? {
+        if let cachedBackground { return cachedBackground }
+        let image = buffer.context.makeImage()
+        cachedBackground = image
+        return image
+    }
+
+    private func scratchBuffer() -> PixelBuffer? {
+        if let scratch, scratch.width == buffer.width, scratch.height == buffer.height {
+            return scratch
+        }
+        let replacement = PixelBuffer(width: buffer.width, height: buffer.height)
+        scratch = replacement
+        return replacement
     }
 
     // MARK: Pixels
@@ -824,17 +990,17 @@ final class PaintDocument: ObservableObject {
         context.setFillColor(PaintDocument.cgColor(color))
         context.fill(CGRect(x: 0, y: 0, width: buffer.width, height: buffer.height))
         context.restoreGState()
-        didMutate()
+        didMutateBackground()
     }
 
     @inline(__always)
-    private func readPixel(x: Int, y: Int) -> (UInt8, UInt8, UInt8, UInt8) {
-        let base = buffer.offset(x: x, y: y)
+    private func readPixel(_ source: PixelBuffer, x: Int, y: Int) -> (UInt8, UInt8, UInt8, UInt8) {
+        let base = source.offset(x: x, y: y)
         return (
-            buffer.bytes[base],
-            buffer.bytes[base + 1],
-            buffer.bytes[base + 2],
-            buffer.bytes[base + 3]
+            source.bytes[base],
+            source.bytes[base + 1],
+            source.bytes[base + 2],
+            source.bytes[base + 3]
         )
     }
 
@@ -845,38 +1011,6 @@ final class PaintDocument: ObservableObject {
         let y = Int(point.y.rounded(.down))
         guard buffer.contains(x: x, y: y) else { return nil }
         return (x, y)
-    }
-
-    /// Whole-pixel document rectangle covered by `rect`: normalised, grown to
-    /// the enclosing pixel boundaries and clipped to the bitmap. Nil when the
-    /// result would not contain a single pixel.
-    private func pixelRect(_ rect: CGRect) -> CGRect? {
-        guard let normalized = PaintDocument.normalizedRect(rect) else { return nil }
-        let canvas = CGRect(x: 0, y: 0, width: buffer.width, height: buffer.height)
-        let area = normalized.integral.intersection(canvas)
-        guard !area.isNull, area.width >= 1, area.height >= 1 else { return nil }
-        return area
-    }
-
-    /// Rejects non-finite geometry and flips negative extents, so a rectangle
-    /// dragged up or to the left describes the same area as one dragged down.
-    private static func normalizedRect(_ rect: CGRect) -> CGRect? {
-        guard rect.origin.x.isFinite, rect.origin.y.isFinite,
-              rect.size.width.isFinite, rect.size.height.isFinite
-        else { return nil }
-        return rect.standardized
-    }
-
-    /// Rotations this small cannot move a pixel on any canvas we allow.
-    private static let rotationEpsilon: CGFloat = 1e-6
-
-    @inline(__always)
-    private static func sameRect(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        let epsilon: CGFloat = 1e-6
-        return abs(lhs.minX - rhs.minX) <= epsilon
-            && abs(lhs.minY - rhs.minY) <= epsilon
-            && abs(lhs.width - rhs.width) <= epsilon
-            && abs(lhs.height - rhs.height) <= epsilon
     }
 
     /// Keeps drawing coordinates inside the bitmap so a drag that leaves the
@@ -930,10 +1064,20 @@ final class PaintDocument: ObservableObject {
 
     // MARK: Bookkeeping
 
-    /// Marks the pixels changed: invalidates the cached image and wakes views.
+    /// Marks the composite changed: invalidates the cached images and wakes
+    /// views. The background image cache survives, because entity edits do not
+    /// touch the bitmap.
     private func didMutate() {
         cachedImage = nil
+        cachedExcludedImage = nil
+        cachedExcludedID = nil
         revision &+= 1
+    }
+
+    /// `didMutate` plus the background bitmap itself changed.
+    private func didMutateBackground() {
+        cachedBackground = nil
+        didMutate()
     }
 
     /// Records a new logical state (one per committed operation) and republishes

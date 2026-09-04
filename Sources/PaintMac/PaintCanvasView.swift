@@ -4,9 +4,22 @@ import SwiftUI
 
 // MARK: - Native canvas view
 
-/// The editable bitmap surface. Draws `PaintDocument.cgImage` at `zoom`, converts
+/// The editable canvas surface. Draws the document composite at `zoom`, converts
 /// pointer events into document-space coordinates and funnels every mutation through
 /// the document API so that undo checkpoints stay one-per-gesture.
+///
+/// The Select tool is a hand tool over entities, not an area tool: a click picks the
+/// topmost entity under the pointer, a drag on its body moves it, the eight grips
+/// resize it and the circular arrow past its top-right corner rotates it.
+///
+/// The selection frame is an oriented rectangle, never an axis-aligned box: the
+/// selection remembers the entity's own local bounds together with the absolute
+/// matrix that places them, so the outline is the transformed local rectangle and
+/// stays glued to a rotated entity. Every drag builds one candidate *absolute*
+/// transform, previews it by compositing the scene without the entity plus the entity
+/// through that very matrix, and commits it as exactly one
+/// `PaintDocument.setEntityTransform`, so the preview and the document agree, the
+/// frame never inflates over repeated edits and a resize never shears.
 final class PaintCanvasView: NSView {
 
     // MARK: Gesture state
@@ -15,29 +28,42 @@ final class PaintCanvasView: NSView {
         case idle
         case freehand
         case shape
-        case selection(SelectionDrag)
+        case entity(EntityDrag)
     }
 
-    /// The eight resize grips of an axis-aligned selection.
+    /// The eight resize grips, named in the entity's own local frame: the corners and
+    /// edge midpoints of its local bounds, drawn wherever its transform puts them.
     private enum SelectionHandle: CaseIterable {
         case bottomLeft, bottom, bottomRight, left, right, topLeft, top, topRight
     }
 
-    /// What a drag made with the Select tool is doing. Every case previews only;
-    /// the document is mutated once, on mouse up.
-    private enum SelectionDrag {
-        case marquee(anchor: CGPoint)
-        case move(grab: CGPoint, origin: CGRect)
-        case resize(handle: SelectionHandle, origin: CGRect)
-        case rotate(center: CGPoint, grabAngle: CGFloat)
+    /// What a drag with the Select tool is doing to the selected entity. Every case
+    /// only builds `candidateTransform`, an absolute replacement matrix; the document
+    /// is mutated once, on mouse up.
+    ///
+    /// Each case carries `base`, the entity transform read at mouse down, so every
+    /// update re-derives the candidate from that one starting frame instead of
+    /// accumulating a matrix per mouse event.
+    private enum EntityDrag {
+        case move(grab: CGPoint, base: CGAffineTransform)
+        /// `localOrigin` is the rectangle the grip edits in the entity's *own*
+        /// coordinates, which is what keeps a resize square to a rotated frame.
+        case resize(handle: SelectionHandle, localOrigin: CGRect, base: CGAffineTransform)
+        case rotate(center: CGPoint, grabAngle: CGFloat, base: CGAffineTransform)
     }
 
-    /// An opaque rectangular pixel selection: the document rectangle it was lifted
-    /// from, the lifted pixels, and the document revision they were lifted at. Any
-    /// edit the selection did not make bumps the revision and makes it stale.
+    /// The selected entity: its identity, the tight bounds of its own untransformed
+    /// geometry, the absolute matrix that places that geometry in the document, and
+    /// the revision both were read at. Any edit the selection did not make bumps the
+    /// revision and makes the selection stale.
+    ///
+    /// Local bounds plus a matrix, rather than a world-space box, is the whole point:
+    /// the box around a rotated entity is bigger than the entity, so re-reading it
+    /// after every commit is what inflates the frame and shears the next resize.
     private struct Selection {
-        var rect: CGRect
-        var image: CGImage
+        var id: UUID
+        var localBounds: CGRect
+        var transform: CGAffineTransform
         var revision: Int
     }
 
@@ -55,13 +81,16 @@ final class PaintCanvasView: NSView {
     // MARK: Selection state
 
     private var selection: Selection?
-    /// Destination of the transform in flight, `nil` while the selection rests at
-    /// `selection.rect`.
-    private var transformRect: CGRect?
-    /// Counterclockwise preview rotation in radians, always zero at rest.
-    private var transformRotation: CGFloat = 0
-    /// Rectangle of the marquee being dragged out, valid only during `.marquee`.
-    private var marqueeRect: CGRect = .zero
+    /// The absolute transform the manipulation in flight would commit, `nil` at rest,
+    /// so the preview and the commit are literally the same matrix.
+    private var candidateTransform: CGAffineTransform?
+    /// Everything except the selected entity, rendered once per revision so a drag
+    /// re-composites only the entity under the pointer.
+    private var sceneImage: CGImage?
+    private var sceneImageRevision = -1
+    private var sceneImageEntity: UUID?
+    /// True while the closed-hand cursor is pushed for a move drag.
+    private var pushedMoveCursor = false
 
     // MARK: Configuration
 
@@ -103,6 +132,7 @@ final class PaintCanvasView: NSView {
         if newDocument !== document {
             cancelGesture()
             clearSelection()
+            invalidateSceneImage()
             document = newDocument
             observeRevision()
         }
@@ -122,6 +152,9 @@ final class PaintCanvasView: NSView {
         let clampedZoom = max(0.1, newZoom)
         if clampedZoom != zoom {
             zoom = clampedZoom
+            // Grips and the rotation control are view-space sized, so their cursor
+            // rects move with the magnification even though the selection did not.
+            window?.invalidateCursorRects(for: self)
         }
 
         syncSize()
@@ -183,19 +216,63 @@ final class PaintCanvasView: NSView {
         context.setFillColor(NSColor.white.cgColor)
         context.fill(canvasRect)
 
-        if let image = document.cgImage {
-            context.saveGState()
-            context.interpolationQuality = zoom >= 1 ? .none : .high
-            context.draw(image, in: canvasRect)
-            context.restoreGState()
-        }
-
+        drawDocument(in: context)
         drawShapePreview(in: context)
-        drawSelection(in: context)
+        drawSelectionChrome(in: context)
 
         context.setStrokeColor(NSColor.separatorColor.cgColor)
         context.setLineWidth(1)
         context.stroke(canvasRect.insetBy(dx: 0.5, dy: 0.5))
+    }
+
+    /// With nothing selected the document's own composite is a single image. With a
+    /// selection the scene is drawn without the selected entity and the entity is
+    /// drawn above it through the candidate absolute transform, so what is on screen
+    /// during a drag is exactly what `setEntityTransform` commits on mouse up.
+    private func drawDocument(in context: CGContext) {
+        guard let selection else {
+            draw(image: document.cgImage, in: context)
+            return
+        }
+
+        draw(image: sceneImage(excluding: selection.id), in: context)
+
+        context.saveGState()
+        context.clip(to: canvasRect)
+        context.scaleBy(x: zoom, y: zoom)
+        document.drawEntity(
+            selection.id,
+            in: context,
+            using: candidateTransform ?? selection.transform
+        )
+        context.restoreGState()
+    }
+
+    private func draw(image: CGImage?, in context: CGContext) {
+        guard let image else { return }
+        context.saveGState()
+        context.interpolationQuality = zoom >= 1 ? .none : .high
+        context.draw(image, in: canvasRect)
+        context.restoreGState()
+    }
+
+    /// The scene without the selected entity, rebuilt only when the document
+    /// revision or the selected entity changes.
+    private func sceneImage(excluding id: UUID) -> CGImage? {
+        if let sceneImage, sceneImageRevision == document.revision, sceneImageEntity == id {
+            return sceneImage
+        }
+        let image = document.renderedImage(excludingEntity: id)
+        sceneImage = image
+        sceneImageRevision = document.revision
+        sceneImageEntity = id
+        return image
+    }
+
+    private func invalidateSceneImage() {
+        sceneImage = nil
+        sceneImageRevision = -1
+        sceneImageEntity = nil
     }
 
     /// Previews the exact path `PaintDocument.addShape` will stroke: endpoints are
@@ -230,32 +307,39 @@ final class PaintCanvasView: NSView {
 
     // MARK: Selection geometry
 
-    /// Controls are measured in view points and divided by `zoom` only where the
-    /// math happens in document space, so grips stay the same size on screen at
-    /// every magnification.
+    /// Controls are measured in view points, so the grips and the rotation control
+    /// stay the same size on screen at every magnification.
     private static let handleSide: CGFloat = 8
     private static let handleHitSlop: CGFloat = 5
-    private static let rotationHandleDistance: CGFloat = 22
-    private static let rotationHandleRadius: CGFloat = 5
-    private static let minimumSelectionSide: CGFloat = 4
+    /// How far past the transformed top-right corner the rotation control sits, along
+    /// the frame's own outward centre-to-corner direction.
+    private static let rotationControlOffset: CGFloat = 17
+    private static let rotationControlRadius: CGFloat = 9
+    private static let minimumSelectionSide: CGFloat = 2
     private static let rotationSnap: CGFloat = .pi / 12
+    /// Pointer reach when picking an entity or a grip, in view points.
+    private static let pickSlop: CGFloat = 4
 
-    /// The rectangle the selection currently occupies on screen: the transform in
-    /// flight when there is one, otherwise where the pixels were lifted from.
-    private var activeSelectionRect: CGRect? {
+    /// The frame every piece of chrome is built from: the entity's own local bounds
+    /// plus the matrix in force, which is the candidate in flight or the resting
+    /// transform. Nothing here is ever an axis-aligned world box.
+    private var selectionFrame: (localBounds: CGRect, transform: CGAffineTransform)? {
         guard let selection else { return nil }
-        return transformRect ?? selection.rect
+        return (selection.localBounds, candidateTransform ?? selection.transform)
     }
 
-    private func viewRect(for rect: CGRect) -> CGRect {
-        CGRect(
-            x: rect.minX * zoom,
-            y: rect.minY * zoom,
-            width: rect.width * zoom,
-            height: rect.height * zoom
-        )
+    private func viewPoint(for point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x * zoom, y: point.y * zoom)
     }
 
+    /// A local-space point taken all the way to view space: through the frame's matrix
+    /// into the document, then through the zoom.
+    private func viewPoint(_ local: CGPoint, through transform: CGAffineTransform) -> CGPoint {
+        viewPoint(for: local.applying(transform))
+    }
+
+    /// Where a grip sits in the entity's own coordinates: a corner or an edge midpoint
+    /// of the local bounds. The frame's matrix decides where that lands on screen.
     private func handlePoint(_ handle: SelectionHandle, in rect: CGRect) -> CGPoint {
         let x: CGFloat
         switch handle {
@@ -272,61 +356,93 @@ final class PaintCanvasView: NSView {
         return CGPoint(x: x, y: y)
     }
 
-    /// Rotation grip, in view space, above the top edge and pulled back inside the
-    /// canvas when the selection is flush with the top so it stays reachable.
-    private func rotationHandleViewPoint(for rect: CGRect) -> CGPoint {
-        let frame = viewRect(for: rect)
-        let limit = max(0, canvasRect.maxY - Self.rotationHandleRadius - 1)
-        return CGPoint(
-            x: frame.midX,
-            y: min(frame.maxY + Self.rotationHandleDistance, limit)
+    /// The grip's screen box: an axis-aligned square of fixed view-space size centred
+    /// on the transformed grip point, so the grips ride the rotated frame while
+    /// staying the same size on screen at every magnification.
+    private func handleViewRect(
+        _ handle: SelectionHandle,
+        in rect: CGRect,
+        through transform: CGAffineTransform
+    ) -> CGRect {
+        let point = viewPoint(handlePoint(handle, in: rect), through: transform)
+        return CGRect(
+            x: point.x - Self.handleSide / 2,
+            y: point.y - Self.handleSide / 2,
+            width: Self.handleSide,
+            height: Self.handleSide
         )
     }
 
-    // MARK: Selection drawing
+    /// The selection outline: the local bounds pushed through the frame's matrix and
+    /// then the zoom, so it is the transformed quadrilateral itself rather than the box
+    /// around it. That is what keeps the frame snug on a rotated entity instead of
+    /// growing on every edit.
+    private func selectionOutlinePath(
+        for rect: CGRect,
+        through transform: CGAffineTransform
+    ) -> CGPath {
+        var total = transform.concatenating(CGAffineTransform(scaleX: zoom, y: zoom))
+        return CGPath(rect: rect, transform: &total)
+    }
 
-    /// Draws the marquee, or the selection: the source area vacated with Color 2 and
-    /// the lifted pixels drawn transformed above it, exactly the way
-    /// `PaintDocument.transformSelection` will commit them, plus the grips.
-    private func drawSelection(in context: CGContext) {
-        if case .selection(.marquee) = gesture {
-            drawMarchingAnts(around: CGPath(rect: viewRect(for: marqueeRect), transform: nil), in: context)
-            return
-        }
+    /// The corner the rotation control hangs off: the frame's local top-right, in view
+    /// space, wherever the matrix has put it.
+    private func rotationAnchorViewPoint(
+        for rect: CGRect,
+        through transform: CGAffineTransform
+    ) -> CGPoint {
+        viewPoint(CGPoint(x: rect.maxX, y: rect.maxY), through: transform)
+    }
 
-        guard let selection, let destination = activeSelectionRect else { return }
+    /// The rotation control sits just beyond that corner, along the outward direction
+    /// from the frame's centre through it, so it follows the entity's own orientation.
+    /// It is pulled back inside the canvas when the selection is flush with an edge so
+    /// it stays reachable.
+    private func rotationControlViewPoint(
+        for rect: CGRect,
+        through transform: CGAffineTransform
+    ) -> CGPoint {
+        let corner = rotationAnchorViewPoint(for: rect, through: transform)
+        let centre = viewPoint(CGPoint(x: rect.midX, y: rect.midY), through: transform)
+        let dx = corner.x - centre.x
+        let dy = corner.y - centre.y
+        // A collapsed frame has no outward direction; the plain diagonal is the honest
+        // fallback there.
+        let direction = dx == 0 && dy == 0 ? CGFloat.pi / 4 : atan2(dy, dx)
+        let reach = Self.rotationControlOffset
+        let inset = Self.rotationControlRadius + 1
+        return CGPoint(
+            x: clamp(corner.x + reach * cos(direction), inset, canvasRect.maxX - inset),
+            y: clamp(corner.y + reach * sin(direction), inset, canvasRect.maxY - inset)
+        )
+    }
 
-        let isTransforming = destination != selection.rect || transformRotation != 0
-        let frame = viewRect(for: destination)
+    private func clamp(_ value: CGFloat, _ lower: CGFloat, _ upper: CGFloat) -> CGFloat {
+        min(max(value, lower), max(lower, upper))
+    }
 
-        if isTransforming {
-            context.saveGState()
-            context.clip(to: canvasRect)
-            context.setFillColor(secondaryColor.cgColor)
-            context.fill(viewRect(for: selection.rect))
-            context.interpolationQuality = .high
-            context.translateBy(x: frame.midX, y: frame.midY)
-            context.rotate(by: transformRotation)
-            context.draw(
-                selection.image,
-                in: CGRect(
-                    x: -frame.width / 2,
-                    y: -frame.height / 2,
-                    width: frame.width,
-                    height: frame.height
-                )
-            )
-            context.restoreGState()
-        }
+    // MARK: Selection chrome
 
-        var transform = CGAffineTransform(translationX: frame.midX, y: frame.midY)
-            .rotated(by: transformRotation)
-            .translatedBy(x: -frame.midX, y: -frame.midY)
-        let outline = CGPath(rect: frame, transform: &transform)
-        drawMarchingAnts(around: outline, in: context)
+    /// Outline, resize grips and the rotation control, every one of them built from
+    /// the oriented frame. The grips are drawn at rest only: during a drag the outline
+    /// alone tracks the candidate.
+    private func drawSelectionChrome(in context: CGContext) {
+        guard tool == .select, let frame = selectionFrame else { return }
+        let (local, transform) = frame
+
+        drawMarchingAnts(
+            around: selectionOutlinePath(for: local, through: transform),
+            in: context
+        )
+
+        drawRotationControl(
+            from: rotationAnchorViewPoint(for: local, through: transform),
+            at: rotationControlViewPoint(for: local, through: transform),
+            in: context
+        )
 
         guard case .idle = gesture else { return }
-        drawHandles(for: destination, in: context)
+        drawHandles(for: local, through: transform, in: context)
     }
 
     /// A white underlay with a black dash on top, so the border reads over any paint.
@@ -345,40 +461,95 @@ final class PaintCanvasView: NSView {
         context.restoreGState()
     }
 
-    private func drawHandles(for rect: CGRect, in context: CGContext) {
-        let frame = viewRect(for: rect)
-        let rotation = rotationHandleViewPoint(for: rect)
-
+    private func drawHandles(
+        for rect: CGRect,
+        through transform: CGAffineTransform,
+        in context: CGContext
+    ) {
         context.saveGState()
         context.setShouldAntialias(true)
         context.setStrokeColor(NSColor.black.cgColor)
         context.setFillColor(NSColor.white.cgColor)
         context.setLineWidth(1)
-
-        context.move(to: CGPoint(x: frame.midX, y: frame.maxY))
-        context.addLine(to: rotation)
-        context.strokePath()
-
         for handle in SelectionHandle.allCases {
-            let point = handlePoint(handle, in: rect)
-            let box = CGRect(
-                x: point.x * zoom - Self.handleSide / 2,
-                y: point.y * zoom - Self.handleSide / 2,
-                width: Self.handleSide,
-                height: Self.handleSide
-            )
+            let box = handleViewRect(handle, in: rect, through: transform)
             context.fill(box)
             context.stroke(box.insetBy(dx: 0.5, dy: 0.5))
         }
+        context.restoreGState()
+    }
 
-        let knob = CGRect(
-            x: rotation.x - Self.rotationHandleRadius,
-            y: rotation.y - Self.rotationHandleRadius,
-            width: Self.rotationHandleRadius * 2,
-            height: Self.rotationHandleRadius * 2
+    /// The rotation affordance: a stem out of the corner ending in a white disc that
+    /// carries a circular arrow, so the control says "rotate" on sight.
+    private func drawRotationControl(from corner: CGPoint, at center: CGPoint, in context: CGContext) {
+        let radius = Self.rotationControlRadius
+
+        context.saveGState()
+        context.setShouldAntialias(true)
+        context.setLineCap(.round)
+
+        context.move(to: corner)
+        context.addLine(to: center)
+        context.setStrokeColor(NSColor.white.cgColor)
+        context.setLineWidth(2.5)
+        context.strokePath()
+        context.move(to: corner)
+        context.addLine(to: center)
+        context.setStrokeColor(NSColor.black.cgColor)
+        context.setLineWidth(1)
+        context.strokePath()
+
+        let disc = CGRect(
+            x: center.x - radius,
+            y: center.y - radius,
+            width: radius * 2,
+            height: radius * 2
         )
-        context.fillEllipse(in: knob)
-        context.strokeEllipse(in: knob.insetBy(dx: 0.5, dy: 0.5))
+        context.setFillColor(NSColor.white.cgColor)
+        context.fillEllipse(in: disc)
+        context.setStrokeColor(NSColor.black.cgColor)
+        context.setLineWidth(1)
+        context.strokeEllipse(in: disc.insetBy(dx: 0.5, dy: 0.5))
+
+        // The circular arrow itself: an arc that stops short of a full turn, with a
+        // solid head seated on its leading end and pointing along the turn.
+        let arcRadius = max(1.5, radius - 3.4)
+        let start: CGFloat = -0.85
+        let head: CGFloat = 3.9
+        context.setLineWidth(1.3)
+        context.beginPath()
+        context.addArc(
+            center: center,
+            radius: arcRadius,
+            startAngle: start,
+            endAngle: head - 0.5,
+            clockwise: false
+        )
+        context.strokePath()
+
+        let seat = CGPoint(
+            x: center.x + arcRadius * cos(head),
+            y: center.y + arcRadius * sin(head)
+        )
+        let along = head + .pi / 2
+        let apex: CGFloat = 2.6
+        let spread: CGFloat = 2.1
+        context.beginPath()
+        context.move(to: CGPoint(
+            x: seat.x + apex * cos(along),
+            y: seat.y + apex * sin(along)
+        ))
+        context.addLine(to: CGPoint(
+            x: seat.x + spread * cos(head),
+            y: seat.y + spread * sin(head)
+        ))
+        context.addLine(to: CGPoint(
+            x: seat.x - spread * cos(head),
+            y: seat.y - spread * sin(head)
+        ))
+        context.closePath()
+        context.setFillColor(NSColor.black.cgColor)
+        context.fillPath()
         context.restoreGState()
     }
 
@@ -495,8 +666,8 @@ final class PaintCanvasView: NSView {
         case .shape:
             shapeEnd = point
             needsDisplay = true
-        case .selection(let drag):
-            updateSelectionDrag(drag, at: point)
+        case .entity(let drag):
+            updateEntityDrag(drag, at: point)
         case .idle:
             break
         }
@@ -531,9 +702,9 @@ final class PaintCanvasView: NSView {
                 color: color,
                 constrained: shiftHeld
             )
-        case .selection(let drag):
-            updateSelectionDrag(drag, at: point)
-            commitSelectionDrag(drag)
+        case .entity(let drag):
+            updateEntityDrag(drag, at: point)
+            commitEntityDrag()
         case .idle:
             break
         }
@@ -543,15 +714,14 @@ final class PaintCanvasView: NSView {
     }
 
     /// Drops any in-flight gesture without committing pixels. A selection transform
-    /// only ever lived in the preview, so dropping it restores the resting selection.
+    /// only ever lived in the candidate, so dropping it restores the resting frame.
     private func cancelGesture() {
         switch gesture {
         case .freehand:
             document.cancelStroke()
-        case .selection:
-            transformRect = nil
-            transformRotation = 0
-            marqueeRect = .zero
+        case .entity:
+            candidateTransform = nil
+            releaseMoveCursor()
         case .shape, .idle:
             break
         }
@@ -571,164 +741,215 @@ final class PaintCanvasView: NSView {
 
     // MARK: Selection interaction
 
-    /// Select-tool mouse down: grab the rotation grip, a resize grip or the body of
-    /// the resting selection, otherwise drop it and start a new marquee.
+    /// Select-tool mouse down. The rotation control, a resize grip and the body of
+    /// the current selection come first, then the topmost entity under the pointer.
+    /// Empty canvas deselects; nothing here ever starts an area marquee.
     private func beginSelectionGesture(at point: CGPoint, viewPoint: CGPoint) {
-        if let rect = activeSelectionRect {
-            if hitsRotationHandle(viewPoint, for: rect) {
-                let center = CGPoint(x: rect.midX, y: rect.midY)
-                gesture = .selection(.rotate(
-                    center: center,
-                    grabAngle: angle(from: center, to: point)
+        if let current = selection {
+            let local = current.localBounds
+            let base = current.transform
+            if hitsRotationControl(viewPoint, for: local, through: base) {
+                let centre = CGPoint(x: local.midX, y: local.midY).applying(base)
+                begin(.rotate(
+                    center: centre,
+                    grabAngle: angle(from: centre, to: point),
+                    base: base
                 ))
-                transformRect = rect
-                transformRotation = 0
-                needsDisplay = true
                 return
             }
-            if let handle = handle(at: viewPoint, for: rect) {
-                gesture = .selection(.resize(handle: handle, origin: rect))
-                transformRect = rect
-                needsDisplay = true
+            if let handle = handle(at: viewPoint, for: local, through: base) {
+                begin(.resize(handle: handle, localOrigin: local, base: base))
                 return
             }
-            if rect.contains(point) {
-                gesture = .selection(.move(grab: point, origin: rect))
-                transformRect = rect
-                needsDisplay = true
+            // The body is the ink, not a box around it: asking the model keeps a drag
+            // on a rotated entity honest, where the frame's bounding box would both
+            // grab empty canvas beside it and still lose the parts poking out.
+            if document.entityHitTest(current.id, at: point, tolerance: pickTolerance) {
+                begin(.move(grab: point, base: base))
                 return
             }
-            clearSelection()
         }
 
-        let anchor = clampedToCanvas(point)
-        gesture = .selection(.marquee(anchor: anchor))
-        marqueeRect = CGRect(origin: anchor, size: .zero)
+        guard let id = document.entityID(at: point, tolerance: pickTolerance) else {
+            clearSelection()
+            return
+        }
+        guard select(id), let base = selection?.transform else { return }
+        begin(.move(grab: point, base: base))
+    }
+
+    private func begin(_ drag: EntityDrag) {
+        candidateTransform = nil
+        gesture = .entity(drag)
+        if case .move = drag, !pushedMoveCursor {
+            NSCursor.closedHand.push()
+            pushedMoveCursor = true
+        }
         needsDisplay = true
     }
 
-    /// Every selection drag is preview only: nothing here touches the document.
-    private func updateSelectionDrag(_ drag: SelectionDrag, at point: CGPoint) {
+    /// Makes `id` the selection, reading the tight bounds of its own untransformed
+    /// geometry together with the matrix that places them. An entity that draws
+    /// nothing cannot be selected.
+    @discardableResult
+    private func select(_ id: UUID) -> Bool {
+        guard
+            let localBounds = document.entityLocalBounds(id),
+            let transform = document.entityTransform(id)
+        else {
+            clearSelection()
+            return false
+        }
+        if selection?.id != id {
+            invalidateSceneImage()
+        }
+        selection = Selection(
+            id: id,
+            localBounds: localBounds,
+            transform: transform,
+            revision: document.revision
+        )
+        candidateTransform = nil
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+        return true
+    }
+
+    /// Every entity drag is preview only: nothing here touches the document. Each case
+    /// builds the whole absolute matrix the commit will store, always from the frame
+    /// the gesture started at, so dragging back to where it began restores the
+    /// original exactly instead of leaving accumulated rounding behind.
+    private func updateEntityDrag(_ drag: EntityDrag, at point: CGPoint) {
         switch drag {
-        case .marquee(let anchor):
-            marqueeRect = snappedRect(
-                CGRect(
-                    x: anchor.x,
-                    y: anchor.y,
-                    width: clampedToCanvas(point).x - anchor.x,
-                    height: clampedToCanvas(point).y - anchor.y
-                )
+        case let .move(grab, base):
+            // Translation and rotation are world-space gestures, so they compose
+            // after everything the entity already carries.
+            candidateTransform = base.concatenating(
+                PaintEntity.moveTransform(dx: point.x - grab.x, dy: point.y - grab.y)
             )
-        case .move(let grab, let origin):
-            transformRect = movedRect(
-                origin,
-                by: CGPoint(x: point.x - grab.x, y: point.y - grab.y)
+        case let .resize(handle, localOrigin, base):
+            candidateTransform = resizeTransform(
+                handle: handle,
+                localOrigin: localOrigin,
+                base: base,
+                to: point
             )
-        case .resize(let handle, let origin):
-            transformRect = resizedRect(origin, handle: handle, to: point)
-        case .rotate(let center, let grabAngle):
-            var rotation = angle(from: center, to: point) - grabAngle
+        case let .rotate(centre, grabAngle, base):
+            var rotation = angle(from: centre, to: point) - grabAngle
             if shiftHeld {
                 rotation = (rotation / Self.rotationSnap).rounded() * Self.rotationSnap
             }
-            transformRotation = rotation
+            candidateTransform = base.concatenating(
+                PaintEntity.rotationTransform(by: rotation, around: centre)
+            )
         }
         needsDisplay = true
     }
 
-    /// Mouse up. A marquee lifts pixels without touching the document; every other
-    /// drag commits exactly one `transformSelection`, then the selection is recaptured
-    /// where it landed so it stays live for the next transform.
-    private func commitSelectionDrag(_ drag: SelectionDrag) {
-        defer {
-            transformRect = nil
-            transformRotation = 0
-            marqueeRect = .zero
-        }
+    /// Mouse up: the candidate becomes exactly one document transform, the scene
+    /// behind the entity is rebuilt and the committed matrix is read back under the
+    /// same local bounds. The geometry never changed — only the matrix — so the frame
+    /// that was on screen a moment ago is the frame that stays, which is what keeps a
+    /// rotate-resize-rotate run stable instead of inflating it step by step.
+    private func commitEntityDrag() {
+        let candidate = candidateTransform
+        candidateTransform = nil
+        releaseMoveCursor()
+        needsDisplay = true
 
-        if case .marquee = drag {
-            captureSelection(in: marqueeRect)
+        guard let current = selection, let candidate else { return }
+        guard PaintEntity.isInvertible(candidate), candidate != current.transform else {
             return
         }
 
-        guard let current = selection, let destination = transformRect else { return }
-        let rotation = transformRotation
-        guard destination != current.rect || rotation != 0 else { return }
+        document.setEntityTransform(current.id, to: candidate)
+        invalidateSceneImage()
 
-        document.transformSelection(
-            current.image,
-            from: current.rect,
-            to: destination,
-            rotation: rotation,
-            background: secondaryColor
-        )
-        captureSelection(in: rotatedBounds(of: destination, rotation: rotation))
-    }
-
-    /// Lifts the pixels of `rect`; no mutation, no history. A rectangle too small to
-    /// hold a pixel simply leaves nothing selected.
-    private func captureSelection(in rect: CGRect) {
-        let area = snappedRect(rect)
-        guard area.width >= 1, area.height >= 1,
-            let image = document.selectionImage(in: area)
-        else {
+        guard let committed = document.entityTransform(current.id) else {
             clearSelection()
             return
         }
-        selection = Selection(rect: area, image: image, revision: document.revision)
-        needsDisplay = true
+        selection = Selection(
+            id: current.id,
+            localBounds: current.localBounds,
+            transform: committed,
+            revision: document.revision
+        )
         window?.invalidateCursorRects(for: self)
     }
 
     private func clearSelection() {
-        guard selection != nil || transformRect != nil else { return }
+        releaseMoveCursor()
+        candidateTransform = nil
+        guard selection != nil else { return }
         selection = nil
-        transformRect = nil
-        transformRotation = 0
+        invalidateSceneImage()
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
     }
 
     /// Any edit the selection did not make — undo, redo, another tool, a canvas
-    /// resize — leaves the lifted pixels describing a document that no longer exists.
+    /// resize — can move or remove the entity underneath it, so the selection is
+    /// dropped rather than left describing a document that no longer exists.
     private func discardStaleSelection() {
         guard let current = selection, current.revision != document.revision else { return }
-        if case .selection = gesture {
+        if case .entity = gesture {
             cancelGesture()
         }
         clearSelection()
     }
 
-    /// Delete and Backspace erase the selected pixels with Color 2, in one undoable
-    /// step, and leave nothing selected.
+    /// Delete and Backspace remove the selected entity in one undoable step and
+    /// leave nothing selected.
     @discardableResult
-    private func deleteSelection() -> Bool {
+    private func deleteSelectedEntity() -> Bool {
         guard let current = selection else { return false }
-        if case .selection = gesture {
+        if case .entity = gesture {
             cancelGesture()
         }
-        document.deleteSelection(in: current.rect, background: secondaryColor)
+        document.deleteEntity(current.id)
         clearSelection()
         return true
     }
 
+    /// The closed hand is pushed for the duration of a move drag, because cursor
+    /// rects are not consulted while the mouse is down.
+    private func releaseMoveCursor() {
+        guard pushedMoveCursor else { return }
+        pushedMoveCursor = false
+        NSCursor.pop()
+    }
+
     // MARK: Selection hit testing
 
-    private func hitsRotationHandle(_ viewPoint: CGPoint, for rect: CGRect) -> Bool {
-        let center = rotationHandleViewPoint(for: rect)
-        let reach = Self.rotationHandleRadius + Self.handleHitSlop
-        return abs(viewPoint.x - center.x) <= reach && abs(viewPoint.y - center.y) <= reach
+    /// Pointer reach in document space, so picking an entity stays a constant
+    /// distance on screen at every magnification.
+    private var pickTolerance: CGFloat { max(0.5, Self.pickSlop / zoom) }
+
+    private func hitsRotationControl(
+        _ viewPoint: CGPoint,
+        for rect: CGRect,
+        through transform: CGAffineTransform
+    ) -> Bool {
+        let center = rotationControlViewPoint(for: rect, through: transform)
+        let reach = Self.rotationControlRadius + Self.handleHitSlop
+        return hypot(viewPoint.x - center.x, viewPoint.y - center.y) <= reach
     }
 
     /// The grip nearest the pointer within the grip's own reach, measured in view
-    /// points so the target stays the same size at every zoom.
-    private func handle(at viewPoint: CGPoint, for rect: CGRect) -> SelectionHandle? {
+    /// points against the *transformed* grip positions, so the targets ride the
+    /// rotated frame and stay the same size at every zoom.
+    private func handle(
+        at viewPoint: CGPoint,
+        for rect: CGRect,
+        through transform: CGAffineTransform
+    ) -> SelectionHandle? {
         let reach = Self.handleSide / 2 + Self.handleHitSlop
         var best: (handle: SelectionHandle, distance: CGFloat)?
         for candidate in SelectionHandle.allCases {
-            let point = handlePoint(candidate, in: rect)
-            let dx = abs(viewPoint.x - point.x * zoom)
-            let dy = abs(viewPoint.y - point.y * zoom)
+            let point = self.viewPoint(handlePoint(candidate, in: rect), through: transform)
+            let dx = abs(viewPoint.x - point.x)
+            let dy = abs(viewPoint.y - point.y)
             guard dx <= reach, dy <= reach else { continue }
             let distance = dx + dy
             if let best, best.distance <= distance { continue }
@@ -741,54 +962,45 @@ final class PaintCanvasView: NSView {
         atan2(point.y - center.y, point.x - center.x)
     }
 
-    // MARK: Selection rectangles
+    // MARK: Selection resize
 
-    /// Selection rectangles live on whole document pixels and inside the canvas, the
-    /// same normalization `PaintDocument` applies, so the lifted image, the preview
-    /// and the committed pixels all describe one area.
-    private func snappedRect(_ rect: CGRect) -> CGRect {
-        guard rect.minX.isFinite, rect.minY.isFinite,
-            rect.width.isFinite, rect.height.isFinite
-        else { return .zero }
+    /// A grip drag, resolved entirely in the entity's own coordinates.
+    ///
+    /// The pointer is clamped to the canvas, mapped back through the frame the drag
+    /// started at, and only then allowed to move the local edges the grip owns. The
+    /// resulting local rectangle map is composed *before* the entity transform, so the
+    /// scaling runs along the entity's own axes: a rotated shape grows along its own
+    /// width and height, its local axes stay orthogonal, and no number of
+    /// resize-and-rotate cycles can shear it.
+    private func resizeTransform(
+        handle: SelectionHandle,
+        localOrigin: CGRect,
+        base: CGAffineTransform,
+        to point: CGPoint
+    ) -> CGAffineTransform {
+        guard PaintEntity.isInvertible(base) else { return base }
+        let local = clampedToCanvas(point).applying(base.inverted())
+        guard local.x.isFinite, local.y.isFinite else { return base }
 
-        let normalized = CGRect(
-            x: min(rect.minX, rect.maxX),
-            y: min(rect.minY, rect.maxY),
-            width: abs(rect.width),
-            height: abs(rect.height)
-        )
-        let clamped = normalized.integral.intersection(
-            CGRect(origin: .zero, size: document.canvasSize)
-        )
-        return clamped.isNull ? .zero : clamped
+        let target = resizedLocalRect(localOrigin, handle: handle, to: local, under: base)
+        let map = PaintEntity.mapTransform(from: localOrigin, to: target)
+        guard PaintEntity.isInvertible(map) else { return base }
+        return map.concatenating(base)
     }
 
-    /// Moves by whole pixels and keeps the rectangle wholly on the canvas, so the
-    /// document's own clamp never squeezes the committed image.
-    private func movedRect(_ rect: CGRect, by delta: CGPoint) -> CGRect {
-        let size = document.canvasSize
-        let x = (rect.minX + delta.x).rounded()
-        let y = (rect.minY + delta.y).rounded()
-        return CGRect(
-            x: min(max(0, x), max(0, size.width - rect.width)),
-            y: min(max(0, y), max(0, size.height - rect.height)),
-            width: rect.width,
-            height: rect.height
-        )
-    }
-
-    /// Axis-aligned resize: only the edges the grip owns move, they stop at the canvas
-    /// border and never cross to within `minimumSelectionSide` of the opposite edge.
-    private func resizedRect(
+    /// Only the local edges the grip owns move, and they never cross to within the
+    /// minimum extent of the opposite edge, so the local map stays invertible.
+    ///
+    /// The floor is `minimumSelectionSide` document points divided back through the
+    /// frame's own scale, so a shrunken entity is still allowed to be small while a
+    /// magnified one cannot be squashed below a couple of visible points.
+    private func resizedLocalRect(
         _ rect: CGRect,
         handle: SelectionHandle,
-        to point: CGPoint
+        to point: CGPoint,
+        under transform: CGAffineTransform
     ) -> CGRect {
-        let size = document.canvasSize
-        let minimum = Self.minimumSelectionSide
-        let target = clampedToCanvas(point)
-        let x = target.x.rounded()
-        let y = target.y.rounded()
+        let minimum = minimumLocalSide(under: transform)
 
         var minX = rect.minX
         var maxX = rect.maxX
@@ -797,39 +1009,31 @@ final class PaintCanvasView: NSView {
 
         switch handle {
         case .bottomLeft, .left, .topLeft:
-            minX = max(0, min(x, maxX - minimum))
+            minX = min(point.x, maxX - minimum)
         case .bottomRight, .right, .topRight:
-            maxX = min(size.width, max(x, minX + minimum))
+            maxX = max(point.x, minX + minimum)
         case .bottom, .top:
             break
         }
 
         switch handle {
         case .bottomLeft, .bottom, .bottomRight:
-            minY = max(0, min(y, maxY - minimum))
+            minY = min(point.y, maxY - minimum)
         case .topLeft, .top, .topRight:
-            maxY = min(size.height, max(y, minY + minimum))
+            maxY = max(point.y, minY + minimum)
         case .left, .right:
             break
         }
 
-        return CGRect(
-            x: minX,
-            y: minY,
-            width: max(0, maxX - minX),
-            height: max(0, maxY - minY)
-        )
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
-    /// Bounding box of the rectangle rotated about its own center: the area
-    /// `transformSelection` paints into, and therefore the area to recapture.
-    private func rotatedBounds(of rect: CGRect, rotation: CGFloat) -> CGRect {
-        guard rotation != 0 else { return rect }
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        let transform = CGAffineTransform(translationX: center.x, y: center.y)
-            .rotated(by: rotation)
-            .translatedBy(x: -center.x, y: -center.y)
-        return rect.applying(transform)
+    /// `minimumSelectionSide` document points expressed in local units, through the
+    /// frame's area scale.
+    private func minimumLocalSide(under transform: CGAffineTransform) -> CGFloat {
+        let scale = sqrt(abs(transform.a * transform.d - transform.b * transform.c))
+        guard scale.isFinite, scale > 0 else { return Self.minimumSelectionSide }
+        return Self.minimumSelectionSide / scale
     }
 
     override func keyDown(with event: NSEvent) {
@@ -837,7 +1041,7 @@ final class PaintCanvasView: NSView {
             cancelOperation(nil)
             return
         }
-        if Self.deleteKeyCodes.contains(event.keyCode), deleteSelection() {
+        if Self.deleteKeyCodes.contains(event.keyCode), deleteSelectedEntity() {
             return
         }
         if handleCanvasShortcut(event) { return }
@@ -968,33 +1172,38 @@ final class PaintCanvasView: NSView {
 
     // MARK: Cursors
 
+    /// Every tool keeps its own icon artwork, Select included: its glyph is a hand,
+    /// so the canvas already reads as a hand tool. Over the selected entity the
+    /// system open hand takes over, and a move drag pushes the closed hand.
     override func resetCursorRects() {
         discardCursorRects()
         addCursorRect(bounds, cursor: Self.cursor(for: tool))
 
-        guard tool == .select, let rect = activeSelectionRect else { return }
+        guard tool == .select, let frame = selectionFrame else { return }
+        let (local, transform) = frame
 
-        addSelectionCursorRect(viewRect(for: rect), cursor: .openHand)
+        // Cursor rects are axis-aligned, so the body rect can only be the box around
+        // the oriented outline; every gesture decision uses the outline itself.
+        addSelectionCursorRect(
+            selectionOutlinePath(for: local, through: transform).boundingBoxOfPath,
+            cursor: .openHand
+        )
         for handle in SelectionHandle.allCases {
-            guard let cursor = Self.cursor(for: handle) else { continue }
-            let point = handlePoint(handle, in: rect)
+            guard let cursor = Self.cursor(for: handle, through: transform) else { continue }
             addSelectionCursorRect(
-                CGRect(
-                    x: point.x * zoom - Self.handleSide / 2,
-                    y: point.y * zoom - Self.handleSide / 2,
-                    width: Self.handleSide,
-                    height: Self.handleSide
-                ),
+                handleViewRect(handle, in: local, through: transform),
                 cursor: cursor
             )
         }
-        let rotation = rotationHandleViewPoint(for: rect)
+
+        let control = rotationControlViewPoint(for: local, through: transform)
+        let radius = Self.rotationControlRadius
         addSelectionCursorRect(
             CGRect(
-                x: rotation.x - Self.rotationHandleRadius,
-                y: rotation.y - Self.rotationHandleRadius,
-                width: Self.rotationHandleRadius * 2,
-                height: Self.rotationHandleRadius * 2
+                x: control.x - radius,
+                y: control.y - radius,
+                width: radius * 2,
+                height: radius * 2
             ),
             cursor: .pointingHand
         )
@@ -1007,17 +1216,38 @@ final class PaintCanvasView: NSView {
     }
 
     /// Only the grips a standard cursor describes honestly: the diagonal resize
-    /// cursors are not public API, so the corners keep the Select tool's own artwork.
-    private static func cursor(for handle: SelectionHandle) -> NSCursor? {
+    /// cursors are not public API, so the corners keep the Select tool's own artwork,
+    /// and an edge grip claims a direction only while the entity's own axis still
+    /// points that way. A rotated frame drags along a rotated axis, so it falls back
+    /// to the tool cursor rather than promising a resize the drag will not perform.
+    private static func cursor(
+        for handle: SelectionHandle,
+        through transform: CGAffineTransform
+    ) -> NSCursor? {
+        // The grip moves along the local axis it owns, which is that axis' image
+        // under the frame's matrix.
+        let axis: CGPoint
         switch handle {
         case .left, .right:
-            return .resizeLeftRight
+            axis = CGPoint(x: transform.a, y: transform.b)
         case .top, .bottom:
-            return .resizeUpDown
+            axis = CGPoint(x: transform.c, y: transform.d)
         case .bottomLeft, .bottomRight, .topLeft, .topRight:
             return nil
         }
+        let horizontal = abs(axis.x)
+        let vertical = abs(axis.y)
+        guard horizontal.isFinite, vertical.isFinite, horizontal + vertical > 0 else {
+            return nil
+        }
+        if vertical <= horizontal * axisCursorTolerance { return .resizeLeftRight }
+        if horizontal <= vertical * axisCursorTolerance { return .resizeUpDown }
+        return nil
     }
+
+    /// How far off an axis an edge grip may sit and still borrow the axis-aligned
+    /// resize cursor: a shade under three degrees.
+    private static let axisCursorTolerance: CGFloat = 0.05
 
     /// Always the tool's own artwork: the cache covers every case of `PaintTool`, and
     /// the miss branch renders the same icon rather than degrading to a system cursor.

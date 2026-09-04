@@ -27,6 +27,7 @@ swiftc \
     -o "$binary" \
     "$root/Sources/PaintMac/PaintTypes.swift" \
     "$root/Sources/PaintMac/PaintShapeGeometry.swift" \
+    "$root/Sources/PaintMac/PaintEntity.swift" \
     "$root/Sources/PaintMac/PaintDocument.swift" \
     "$root/Tests/ModelSmoke.swift"
 

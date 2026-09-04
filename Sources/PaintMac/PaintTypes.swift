@@ -9,6 +9,8 @@ import Foundation
 /// them over re-deriving membership.
 enum PaintTool: String, CaseIterable, Identifiable {
     // Drawing tools.
+    /// The hand tool: it paints nothing and instead picks up whole entities to
+    /// move, resize and rotate them.
     case select
     case pencil
     case brush
@@ -114,7 +116,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// geometry preview; these names are the fallback and all exist on macOS 13.
     var symbolName: String {
         switch self {
-        case .select: return "cursorarrow.rays"
+        case .select: return "hand.point.up.left.fill"
         case .pencil: return "pencil"
         case .brush: return "paintbrush.pointed.fill"
         case .thickBrush: return "paintbrush.fill"
