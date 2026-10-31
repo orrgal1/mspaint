@@ -63,7 +63,7 @@ private func paintedWidthSlack(_ expected: Int) -> Int {
 /// Every tool this build must expose, counted literally: eight non-shape tools
 /// plus the twenty-two shapes. A tool added or dropped without updating the
 /// tables below fails here first.
-private let expectedToolCount = 30
+private let expectedToolCount = 31
 
 /// The shape catalogue this build must expose, in palette order. Spelled out
 /// literally rather than derived from `PaintTool`, so dropping, renaming or
@@ -82,7 +82,7 @@ private let expectedShapeCatalogue: [PaintTool] = [
 /// Brush and Eraser: spelled out literally so a dropped or misplaced entry
 /// fails here rather than agreeing with whatever the enum happens to say.
 private let expectedDrawingTools: [PaintTool] = [
-    .select, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
+    .select, .rectSelect, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
 ]
 
 /// The one width every tool draws with, spelled out literally instead of read
@@ -92,7 +92,7 @@ private let expectedDrawingTools: [PaintTool] = [
 /// Eraser matches Brush exactly, and Text and every shape share one fine
 /// outline. Select, Fill and Eyedropper never stroke, so their value is unused.
 private let expectedStrokeWidths: [PaintTool: CGFloat] = [
-    .select: 1, .pencil: 1, .fill: 1, .eyedropper: 1,
+    .select: 1, .rectSelect: 1, .pencil: 1, .fill: 1, .eyedropper: 1,
     .brush: 16, .eraser: 16,
     .thickBrush: 64,
     .text: 4,
@@ -382,6 +382,13 @@ final class ModelSmokeRun {
         try scenario("cancelled stroke") { try cancelledStroke() }
         try scenario("no-op fill") { try noOpFill() }
         try scenario("bounded flood fill") { try boundedFloodFill() }
+        try scenario("opaque selection move") { try selectionMoveOpaque() }
+        try scenario("transparent selection move") { try selectionMoveTransparent() }
+        try scenario("selection flattens only the covered") { try selectionFlattensOnlyTheCovered() }
+        try scenario("selection lands in front") { try selectionLandsInFront() }
+        try scenario("selection delete") { try selectionDelete() }
+        try scenario("selection edges and no-ops") { try selectionEdges() }
+        try scenario("image drop") { try imageDrop() }
         try scenario("colour pick") { try colourPick() }
         try scenario("tool catalogue") { try shapeCatalogue() }
         try scenario("shape geometry") { try shapeGeometry() }
@@ -1047,6 +1054,510 @@ final class ModelSmokeRun {
         )
     }
 
+    // MARK: Raster selection scenarios
+
+    /// The Rectangular Select move, opaque: the captured pixels travel whole,
+    /// the vacated rectangle fills with the erase colour, the covered entity
+    /// bakes into the bitmap, and the whole lift-drag-drop is one checkpoint.
+    private func selectionMoveOpaque() throws {
+        let document = PaintDocument(width: 24, height: 24)
+        doodle(document, [CGPoint(x: 4.5, y: 12.5), CGPoint(x: 9.5, y: 12.5)])
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 1, "entities before the move")
+        try expectInk(document, 6, 12, "the line before the move")
+
+        document.moveSelection(
+            from: CGRect(x: 2, y: 10, width: 8, height: 5),
+            to: CGPoint(x: 12, y: 4),
+            eraseWith: .white,
+            key: nil
+        )
+
+        try expect(document.selectableEntityIDs.isEmpty, "the moved line is baked pixels now")
+        try expectInk(document, 16, 6, "the line landed at the destination")
+        try expectPixel(document, 6, 12, .white, "the vacated rectangle is erased")
+
+        // One checkpoint: undo brings the entity back exactly where it was.
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == ids,
+            "undo restores the same entity"
+        )
+        try expectInk(document, 6, 12, "the line is back after undo")
+        try expectPixel(document, 16, 6, .white, "the destination is page white after undo")
+        document.redo()
+        try expectInk(document, 16, 6, "redo moves the line again")
+    }
+
+    /// The classic Paint transparent selection: pixels of the capture that
+    /// match the key colour stay behind, so the destination shows through
+    /// them and only the carried ink lands.
+    private func selectionMoveTransparent() throws {
+        let document = PaintDocument(width: 24, height: 24)
+        // A red left half and a white right half, divided by a pencil wall —
+        // the wall bakes into raster when the fill flattens it, leaving two
+        // page colours the drop can land on.
+        doodle(document, [CGPoint(x: 12.5, y: 0), CGPoint(x: 12.5, y: 24)])
+        document.floodFill(at: CGPoint(x: 2.5, y: 2.5), color: .red)
+        try expectPixel(document, 2, 12, .red, "the left half is red")
+        try expectPixel(document, 20, 12, .white, "the right half stays white")
+
+        // Ink to carry, resting on the colour that will be keyed out.
+        doodle(document, [CGPoint(x: 4.5, y: 12.5), CGPoint(x: 9.5, y: 12.5)])
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 1, "entities before the move")
+        try expectInk(document, 6, 12, "the line before the move")
+
+        // The floating preview the canvas would draw: same capture, keyed.
+        guard let preview = document.selectionImage(
+            in: CGRect(x: 2, y: 10, width: 8, height: 5),
+            key: .red
+        ) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "selectionImage returned no image for a live rectangle",
+                file: #fileID,
+                line: #line
+            )
+        }
+        try expectEqual(preview.width, 8, "preview image width")
+        try expectEqual(preview.height, 5, "preview image height")
+
+        document.moveSelection(
+            from: CGRect(x: 2, y: 10, width: 8, height: 5),
+            to: CGPoint(x: 13, y: 4),
+            eraseWith: .white,
+            key: .red
+        )
+
+        // Every red pixel of the capture matched the key and stayed behind:
+        // the white half shows through the drop, carrying only the ink.
+        try expectInk(document, 17, 6, "the line landed on the white half")
+        try expectPixel(document, 14, 4, .white, "keyed pixels left the drop corner alone")
+        try expectPixel(document, 20, 8, .white, "keyed pixels left the whole drop alone")
+        try expectPixel(document, 6, 12, .white, "the vacated rectangle is erased")
+        try expect(document.selectableEntityIDs.isEmpty, "the carried line baked into the pixels")
+
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        document.undo()
+        try expectPixel(document, 2, 12, .red, "undo restores the red half")
+        try expectInk(document, 6, 12, "undo restores the line")
+        try expect(
+            document.selectableEntityIDs == ids,
+            "undo restores the carried line as an entity"
+        )
+    }
+
+    /// Only the entities the rectangle covers bake into the bitmap; the rest
+    /// stay editable, and undo brings every one back.
+    private func selectionFlattensOnlyTheCovered() throws {
+        let document = PaintDocument(width: 24, height: 24)
+        doodle(document, [CGPoint(x: 4.5, y: 12.5), CGPoint(x: 9.5, y: 12.5)])
+        doodle(document, [CGPoint(x: 4.5, y: 20.5), CGPoint(x: 9.5, y: 20.5)])
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 2, "two strokes before the move")
+
+        document.moveSelection(
+            from: CGRect(x: 2, y: 10, width: 8, height: 5),
+            to: CGPoint(x: 12, y: 4),
+            eraseWith: .white,
+            key: nil
+        )
+
+        try expectEqual(document.selectableEntityIDs.count, 1, "only the covered stroke bakes")
+        try expect(
+            document.selectableEntityIDs == [ids[1]],
+            "the survivor must be the stroke outside the rectangle"
+        )
+        try expectInk(document, 16, 6, "the covered stroke moved as pixels")
+        try expectInk(document, 6, 20, "the survivor keeps its ink")
+        try expectEntity(
+            document,
+            at: CGPoint(x: 6.5, y: 20.5),
+            tolerance: 2,
+            ids[1],
+            "the survivor stays editable"
+        )
+
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == ids,
+            "undo restores both strokes in order"
+        )
+        try expectInk(document, 6, 12, "the moved stroke is back where it was")
+    }
+
+    /// A landing bakes the entities under it, so moved pixels stay in front
+    /// of them exactly as the floating preview showed. Without this a move
+    /// dropped over a stroke would sink beneath it.
+    private func selectionLandsInFront() throws {
+        let document = PaintDocument(width: 24, height: 24)
+        doodle(document, [CGPoint(x: 4.5, y: 12.5), CGPoint(x: 9.5, y: 12.5)])
+        doodle(document, [CGPoint(x: 16.5, y: 3.5), CGPoint(x: 16.5, y: 9.5)], color: .blue)
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 2, "two strokes before the move")
+        try expectPixel(document, 16, 6, .blue, "the blue stroke crosses the landing")
+
+        // The move carries the black line to y=6, crossing the blue stroke's
+        // column at x=16; the landing covers the stroke's middle.
+        document.moveSelection(
+            from: CGRect(x: 2, y: 10, width: 8, height: 5),
+            to: CGPoint(x: 12, y: 4),
+            eraseWith: .white,
+            key: nil
+        )
+
+        try expect(
+            document.selectableEntityIDs.isEmpty,
+            "both strokes bake: the source one by capture, the covered one by the landing"
+        )
+        try expectPixel(document, 16, 6, .black, "the moved ink lands in front of the covered stroke")
+        try expectPixel(document, 16, 5, .white, "the moved rectangle covers the stroke's middle like a sticker")
+        try expectPixel(document, 16, 3, .blue, "the covered stroke survives above the landing")
+        try expectPixel(document, 16, 9, .blue, "the covered stroke survives below the landing")
+        try expectPixel(document, 6, 12, .white, "the source erased")
+
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == ids,
+            "undo restores both strokes"
+        )
+        try expectPixel(document, 16, 6, .blue, "the crossing is back to the stroke")
+
+        // The transparent landing keys the moved rectangle's white out, so
+        // the baked stroke shows through wherever only background moved.
+        document.moveSelection(
+            from: CGRect(x: 2, y: 10, width: 8, height: 5),
+            to: CGPoint(x: 12, y: 4),
+            eraseWith: .white,
+            key: .white
+        )
+        try expectPixel(document, 16, 6, .black, "the moved ink still lands in front")
+        try expectPixel(document, 16, 5, .blue, "keyed background leaves the covered stroke showing")
+        try expectPixel(document, 16, 3, .blue, "the stroke outside the landing survives")
+    }
+
+    /// Delete over a marquee: the pixels go and the rectangle fills with the
+    /// background colour, as one checkpoint.
+    private func selectionDelete() throws {
+        let document = PaintDocument(width: 24, height: 24)
+        doodle(document, [CGPoint(x: 4.5, y: 12.5), CGPoint(x: 9.5, y: 12.5)])
+
+        document.moveSelection(
+            from: CGRect(x: 2, y: 10, width: 8, height: 5),
+            to: CGPoint(x: 2, y: 10),
+            eraseWith: .blue,
+            key: nil,
+            discardingPixels: true
+        )
+
+        try expect(document.selectableEntityIDs.isEmpty, "delete bakes the covered stroke away")
+        try expectPixel(document, 6, 12, .blue, "the rectangle fills with the erase colour")
+        try expectPixel(document, 2, 10, .blue, "the rectangle's near corner too")
+        try expectPixel(document, 9, 14, .blue, "the rectangle's far corner too")
+        try expectPixel(document, 0, 0, .white, "nothing outside the rectangle changes")
+
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        document.undo()
+        try expectInk(document, 6, 12, "undo brings the stroke back")
+        try expectEqual(document.selectableEntityIDs.count, 1, "the stroke is an entity again")
+    }
+
+    /// Off-canvas drops crop, and rectangles that cover no pixel are no-ops
+    /// that record no history.
+    private func selectionEdges() throws {
+        let document = PaintDocument(width: 16, height: 16)
+        doodle(document, [CGPoint(x: 4.5, y: 8.5), CGPoint(x: 9.5, y: 8.5)])
+        try expectInk(document, 6, 8, "the line before the crop")
+
+        // Dropped mostly off the left edge: the on-canvas part lands, the rest
+        // is cropped away, and the whole source rectangle still erases.
+        document.moveSelection(
+            from: CGRect(x: 2, y: 6, width: 8, height: 5),
+            to: CGPoint(x: -4, y: 12),
+            eraseWith: .white,
+            key: nil
+        )
+        try expectInk(document, 1, 14, "the visible part of the drop")
+        try expectPixel(document, 6, 8, .white, "the source erased")
+        document.undo()
+
+        // Fully off canvas: nothing lands, nothing erases at the destination,
+        // and the call is still one undoable step for the erase.
+        document.moveSelection(
+            from: CGRect(x: 2, y: 6, width: 8, height: 5),
+            to: CGPoint(x: -100, y: -100),
+            eraseWith: .white,
+            key: nil
+        )
+        try expectPixel(document, 6, 8, .white, "the source still erases on a fully off-canvas drop")
+        document.undo()
+        try expectInk(document, 6, 8, "the line is back")
+
+        // Rectangles that cover no pixel record no history and bump nothing.
+        let revision = document.revision
+        let undoDepth = document.canUndo
+        document.moveSelection(
+            from: CGRect(x: 40, y: 40, width: 8, height: 5),
+            to: CGPoint(x: 0, y: 0),
+            eraseWith: .white,
+            key: nil
+        )
+        document.moveSelection(
+            from: CGRect(x: 5, y: 5, width: 0, height: 0),
+            to: CGPoint(x: 8, y: 8),
+            eraseWith: .white,
+            key: nil
+        )
+        try expectEqual(document.revision, revision, "revision after empty rectangles")
+        try expect(
+            document.canUndo == undoDepth,
+            "empty rectangles must leave the undo stack alone"
+        )
+        try expectInk(document, 6, 8, "empty rectangles change no pixel")
+    }
+
+    /// Merging a floating pasted image (`dropImage`, the clipboard landing):
+    /// opaque pixels replace, keyed pixels leave the destination alone,
+    /// semi-transparent pixels blend the way the floating preview draws
+    /// them, drops hanging off the canvas crop, and the whole merge is one
+    /// undoable step.
+    private func imageDrop() throws {
+        let document = PaintDocument(width: 8, height: 6)
+        doodle(document, [CGPoint(x: 1.5, y: 1.5), CGPoint(x: 6.5, y: 1.5)])
+        try expectInk(document, 3, 1, "the line before the drop")
+
+        // An opaque drop replaces the pixels under it; the surrounding line
+        // survives, and the whole drop is one checkpoint.
+        let image = try solidImage(width: 4, height: 3, color: .red)
+        document.dropImage(image, at: CGPoint(x: 2, y: 2), key: nil)
+        try expectPixel(document, 2, 2, .red, "the drop's bottom-left pixel")
+        try expectPixel(document, 5, 4, .red, "the drop's top-right pixel")
+        try expectInk(document, 1, 1, "the line left of the drop survives")
+        try expectInk(document, 6, 1, "the line right of the drop survives")
+
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        document.undo()
+        try expectPixel(document, 2, 2, .white, "the drop is undone")
+        try expectInk(document, 3, 1, "the line is untouched by the undo")
+        document.redo()
+        try expectPixel(document, 2, 2, .red, "the drop is redone")
+
+        // Keyed pixels leave the destination showing through: the image's
+        // black upper band is skipped entirely, the yellow lower band lands.
+        let banded = try bandedImage(width: 4, height: 4, top: .black, bottom: .yellow)
+        document.dropImage(banded, at: CGPoint(x: 0, y: 2), key: .black)
+        try expectPixel(document, 0, 2, .yellow, "the image's lower band lands at the rect's bottom")
+        try expectPixel(document, 3, 5, .white, "the keyed upper band leaves white beneath itself")
+        try expectPixel(document, 3, 4, .red, "the keyed band leaves the earlier drop alone too")
+        document.undo()
+
+        // A semi-transparent pixel blends over the destination: half-alpha
+        // black over white is mid grey, exactly what the preview shows.
+        document.dropImage(
+            try translucentImage(width: 2, height: 2, color: .black, alpha: 0.5),
+            at: CGPoint(x: 0, y: 0),
+            key: nil
+        )
+        try expectPixel(
+            document,
+            0,
+            0,
+            NSColor(srgbRed: 0.5, green: 0.5, blue: 0.5, alpha: 1),
+            "the translucent drop blends over white"
+        )
+        document.undo()
+
+        // A drop hanging off the canvas lands only its on-canvas part.
+        document.dropImage(image, at: CGPoint(x: -2, y: 4), key: nil)
+        try expectPixel(document, 0, 5, .red, "the visible part of the off-canvas drop lands")
+        try expectPixel(document, 0, 3, .white, "the off-canvas drop reaches no further down")
+
+        // Pasting an image taller than the canvas crops it to the part its
+        // top-left anchor keeps.
+        let tall = try bandedImage(width: 4, height: 8, top: .black, bottom: .yellow)
+        let cropped = try requireImage(
+            document.croppedImage(of: tall, limit: CGSize(width: 8, height: 6)),
+            "the cropped paste"
+        )
+        try expect(
+            cropped.width == 4 && cropped.height == 6,
+            "the crop is \(cropped.width)×\(cropped.height), expected 4×6"
+        )
+        document.dropImage(cropped, at: CGPoint(x: 0, y: 0), key: nil)
+        try expectPixel(document, 0, 5, .black, "the crop keeps the image's top rows at the top")
+        try expectPixel(document, 0, 0, .yellow, "the crop's lower band lands at the bottom")
+
+        // A drop lands in front of the entities under it: the covered stroke
+        // bakes into the bitmap and the dropped pixels stay on top.
+        let layered = PaintDocument(width: 12, height: 12)
+        doodle(layered, [CGPoint(x: 5.5, y: 2.5), CGPoint(x: 5.5, y: 9.5)], color: .blue)
+        try expectPixel(layered, 5, 5, .blue, "the blue stroke before the drop")
+        layered.dropImage(
+            try solidImage(width: 4, height: 4, color: .green),
+            at: CGPoint(x: 3, y: 3),
+            key: nil
+        )
+        try expectPixel(layered, 5, 5, .green, "the dropped square covers the stroke")
+        try expectPixel(layered, 5, 2, .blue, "the stroke above the drop survives")
+        try expectPixel(layered, 5, 8, .blue, "the stroke below the drop survives")
+        try expect(layered.selectableEntityIDs.isEmpty, "the covered stroke baked into the bitmap")
+        layered.undo()
+        try expectEqual(layered.selectableEntityIDs.count, 1, "undo brings the stroke back as an entity")
+        try expectPixel(layered, 5, 5, .blue, "the stroke is back over the landing")
+    }
+
+    /// A two-band CGImage: `top` fills the image's upper half, `bottom` its
+    /// lower half. The horizontal split makes an upside-down stamp visible.
+    private func bandedImage(width: Int, height: Int, top: NSColor, bottom: NSColor) throws -> CGImage {
+        guard
+            let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not create the banded fixture context",
+                file: #fileID,
+                line: #line
+            )
+        }
+        for (color, band) in [(top, CGRect(x: 0, y: height / 2, width: width, height: height - height / 2)),
+                             (bottom, CGRect(x: 0, y: 0, width: width, height: height / 2))] {
+            guard let srgb = color.usingColorSpace(.sRGB) else {
+                throw SmokeFailure(
+                    scenario: scenario,
+                    message: "banded fixture colour has no sRGB representation",
+                    file: #fileID,
+                    line: #line
+                )
+            }
+            context.setFillColor(
+                CGColor(
+                    srgbRed: srgb.redComponent,
+                    green: srgb.greenComponent,
+                    blue: srgb.blueComponent,
+                    alpha: 1
+                )
+            )
+            context.fill(band)
+        }
+        guard let image = context.makeImage() else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not render the banded fixture",
+                file: #fileID,
+                line: #line
+            )
+        }
+        return image
+    }
+
+    /// A CGImage of one translucent colour, premultiplied by hand and forced
+    /// with `.copy` so the bytes are exact: the fixture for blend tests.
+    private func translucentImage(width: Int, height: Int, color: NSColor, alpha: CGFloat) throws -> CGImage {
+        guard
+            let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not create the translucent fixture context",
+                file: #fileID,
+                line: #line
+            )
+        }
+        guard let srgb = color.usingColorSpace(.sRGB) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "translucent fixture colour has no sRGB representation",
+                file: #fileID,
+                line: #line
+            )
+        }
+        context.setBlendMode(.copy)
+        context.setFillColor(
+            CGColor(
+                srgbRed: srgb.redComponent * alpha,
+                green: srgb.greenComponent * alpha,
+                blue: srgb.blueComponent * alpha,
+                alpha: alpha
+            )
+        )
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = context.makeImage() else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not render the translucent fixture",
+                file: #fileID,
+                line: #line
+            )
+        }
+        return image
+    }
+
+    /// A tiny opaque CGImage of one solid colour, the fixture for paste tests.
+    private func solidImage(width: Int, height: Int, color: NSColor) throws -> CGImage {
+        guard
+            let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not create the paste fixture context",
+                file: #fileID,
+                line: #line
+            )
+        }
+        guard let srgb = color.usingColorSpace(.sRGB) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "fixture colour has no sRGB representation",
+                file: #fileID,
+                line: #line
+            )
+        }
+        context.setFillColor(
+            CGColor(
+                srgbRed: srgb.redComponent,
+                green: srgb.greenComponent,
+                blue: srgb.blueComponent,
+                alpha: 1
+            )
+        )
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = context.makeImage() else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not render the paste fixture",
+                file: #fileID,
+                line: #line
+            )
+        }
+        return image
+    }
+
     // MARK: Catalogue scenarios
 
     /// The catalogue itself: exactly the promised tools, in order, classified
@@ -1086,6 +1597,30 @@ final class ModelSmokeRun {
                 < (PaintTool.drawingTools.firstIndex(of: .pencil) ?? -1),
             "select must come before pencil in drawingTools, got "
                 + names(PaintTool.drawingTools)
+        )
+        // Rectangular Select is the raster marquee: it belongs beside Select,
+        // ahead of the paint tools, and claims no bare-key shortcut of its own.
+        try expectEqual(
+            PaintTool.drawingTools.firstIndex(of: .rectSelect) ?? -1,
+            expectedDrawingTools.firstIndex(of: .rectSelect) ?? -2,
+            "rectSelect position in drawingTools"
+        )
+        try expect(
+            (PaintTool.drawingTools.firstIndex(of: .select) ?? .max)
+                < (PaintTool.drawingTools.firstIndex(of: .rectSelect) ?? -1)
+                && (PaintTool.drawingTools.firstIndex(of: .rectSelect) ?? .max)
+                    < (PaintTool.drawingTools.firstIndex(of: .pencil) ?? -1),
+            "rectSelect must sit between Select and Pencil in drawingTools, got "
+                + names(PaintTool.drawingTools)
+        )
+        try expect(
+            !PaintTool.rectSelect.isShape,
+            "rectSelect must be a drawing tool, not a shape"
+        )
+        try expect(
+            PaintTool.rectSelect.shortcut == nil,
+            "rectSelect must carry no bare-key shortcut, got "
+                + describe(PaintTool.rectSelect.shortcut)
         )
         try expectEqual(
             PaintTool.drawingTools.firstIndex(of: .thickBrush) ?? -1,
