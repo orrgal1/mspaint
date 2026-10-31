@@ -421,6 +421,203 @@ final class PaintDocument: ObservableObject {
         cachedBackground = nil
     }
 
+    /// Bakes only the entities whose ink can reach `rect` into the background
+    /// bitmap and keeps every other one editable. Records no history of its own:
+    /// the caller owns the checkpoint.
+    private func flattenEntities(intersecting rect: CGRect) {
+        guard !entities.isEmpty else { return }
+        let context = buffer.context
+        var kept: [PaintEntity] = []
+        kept.reserveCapacity(entities.count)
+        for entity in entities {
+            // Bounds contain the ink, so a bounds miss means the selection
+            // cannot have captured any of it; an entity with no measurable
+            // bounds draws nothing worth baking either way.
+            let bounds = entity.bounds(applying: .identity)
+            if bounds.isInfinite || bounds.intersects(rect) {
+                if entity.id == pendingStrokeID { pendingStrokeID = nil }
+                entity.draw(in: context)
+            } else {
+                kept.append(entity)
+            }
+        }
+        if kept.count != entities.count {
+            entities = kept
+            cachedBackground = nil
+        }
+    }
+
+    // MARK: Raster selection
+
+    /// Moves the pixels of a rectangular selection as exactly one undoable
+    /// step: the whole lift-drag-drop run of the Rectangular Select tool
+    /// commits here, so one undo reverts the entire move.
+    ///
+    /// The pixels are read from the composite, so any entity whose bounds
+    /// reach into the rectangle is flattened into the background first — only
+    /// those: entities clear of the rectangle stay editable. The vacated
+    /// rectangle is filled with `eraseWith` (Color 2, the background colour),
+    /// and the captured pixels are blitted back with their bottom-left corner
+    /// at `target`, cropped to the canvas. With `key` non-nil, captured pixels
+    /// that exactly match it are left out of the blit — the classic Paint
+    /// transparent selection, where the destination shows through wherever the
+    /// selection carried the background colour. `discardingPixels` skips the
+    /// blit entirely, which is Delete. A rectangle that covers no pixel is a
+    /// no-op that records no history.
+    func moveSelection(
+        from source: CGRect,
+        to target: CGPoint,
+        eraseWith: NSColor,
+        key: NSColor?,
+        discardingPixels: Bool = false
+    ) {
+        guard let rect = pixelRect(source) else { return }
+
+        let snapshot = makeSnapshot()
+        let captured = captureSelectionPixels(rect, from: compositedBuffer(excluding: nil))
+        flattenEntities(intersecting: CGRect(
+            x: CGFloat(rect.x),
+            y: CGFloat(rect.y),
+            width: CGFloat(rect.width),
+            height: CGFloat(rect.height)
+        ))
+        fillPixelRect(rect, with: PaintDocument.components(of: eraseWith))
+
+        if !discardingPixels, let captured {
+            let keyComponents = key.map { PaintDocument.components(of: $0) }
+            blitSelectionPixels(
+                captured,
+                of: rect,
+                to: target,
+                skipping: keyComponents
+            )
+        }
+
+        pushUndo(snapshot)
+        didMutateBackground()
+        markMutated()
+    }
+
+    /// The composite pixels of `rect` as an image, for the floating preview
+    /// the canvas draws while a selection move is in flight. With `key`
+    /// non-nil, pixels that exactly match it come back fully transparent, so
+    /// the same call serves both draw modes and never touches the document.
+    func selectionImage(in rect: CGRect, key: NSColor?) -> CGImage? {
+        guard let rect = pixelRect(rect) else { return nil }
+        guard let captured = captureSelectionPixels(rect, from: compositedBuffer(excluding: nil)) else {
+            return nil
+        }
+
+        let keyComponents = key.map { PaintDocument.components(of: $0) }
+        guard
+            let surface = PixelBuffer(width: rect.width, height: rect.height)
+        else { return nil }
+        for row in 0..<rect.height {
+            for column in 0..<rect.width {
+                let source = (row * rect.width + column) * 4
+                let pixel = (
+                    captured[source],
+                    captured[source + 1],
+                    captured[source + 2],
+                    captured[source + 3]
+                )
+                if let keyComponents, PaintDocument.matches(pixel, keyComponents, tolerance: 0) {
+                    // Knocked out: written explicitly, because a freshly
+                    // allocated context's contents are not guaranteed zeroed.
+                    let hole = surface.offset(x: column, y: row)
+                    surface.bytes[hole] = 0
+                    surface.bytes[hole + 1] = 0
+                    surface.bytes[hole + 2] = 0
+                    surface.bytes[hole + 3] = 0
+                    continue
+                }
+                let destination = surface.offset(x: column, y: row)
+                surface.bytes[destination] = pixel.0
+                surface.bytes[destination + 1] = pixel.1
+                surface.bytes[destination + 2] = pixel.2
+                surface.bytes[destination + 3] = pixel.3
+            }
+        }
+        return surface.context.makeImage()
+    }
+
+    /// A document-space rectangle snapped to the whole pixels it covers and
+    /// clipped to the canvas, or nil when nothing of it remains.
+    private func pixelRect(_ rect: CGRect) -> (x: Int, y: Int, width: Int, height: Int)? {
+        let x0 = max(0, Int(rect.minX.rounded(.down)))
+        let y0 = max(0, Int(rect.minY.rounded(.down)))
+        let x1 = min(buffer.width, Int(rect.maxX.rounded(.up)))
+        let y1 = min(buffer.height, Int(rect.maxY.rounded(.up)))
+        guard x1 > x0, y1 > y0 else { return nil }
+        return (x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+    }
+
+    /// Copies `rect` out of `source`, row 0 the bottom row of the rectangle.
+    private func captureSelectionPixels(
+        _ rect: (x: Int, y: Int, width: Int, height: Int),
+        from source: PixelBuffer
+    ) -> [UInt8]? {
+        var pixels = [UInt8](repeating: 0, count: rect.width * rect.height * 4)
+        pixels.withUnsafeMutableBufferPointer { destination in
+            for row in 0..<rect.height {
+                let sourceBase = source.offset(x: rect.x, y: rect.y + row)
+                let destinationBase = row * rect.width * 4
+                for byte in 0..<(rect.width * 4) {
+                    destination[destinationBase + byte] = source.bytes[sourceBase + byte]
+                }
+            }
+        }
+        return pixels
+    }
+
+    /// Writes `fill` over every pixel of `rect` in the background bitmap.
+    private func fillPixelRect(
+        _ rect: (x: Int, y: Int, width: Int, height: Int),
+        with fill: (UInt8, UInt8, UInt8, UInt8)
+    ) {
+        for row in 0..<rect.height {
+            let base = buffer.offset(x: rect.x, y: rect.y + row)
+            for column in 0..<rect.width {
+                let pixel = base + column * 4
+                buffer.bytes[pixel] = fill.0
+                buffer.bytes[pixel + 1] = fill.1
+                buffer.bytes[pixel + 2] = fill.2
+                buffer.bytes[pixel + 3] = fill.3
+            }
+        }
+    }
+
+    /// Blits captured selection pixels back so the rectangle's bottom-left
+    /// corner lands at `target`, cropped to the canvas. Pixels equal to `key`
+    /// are skipped, which is what makes the destination show through them.
+    private func blitSelectionPixels(
+        _ pixels: [UInt8],
+        of rect: (x: Int, y: Int, width: Int, height: Int),
+        to target: CGPoint,
+        skipping key: (UInt8, UInt8, UInt8, UInt8)?
+    ) {
+        guard target.x.isFinite, target.y.isFinite else { return }
+        let targetX = Int(target.x.rounded(.down))
+        let targetY = Int(target.y.rounded(.down))
+
+        for row in 0..<rect.height {
+            let destinationY = targetY + row
+            guard destinationY >= 0, destinationY < buffer.height else { continue }
+            for column in 0..<rect.width {
+                let destinationX = targetX + column
+                guard destinationX >= 0, destinationX < buffer.width else { continue }
+                let source = (row * rect.width + column) * 4
+                let pixel = (pixels[source], pixels[source + 1], pixels[source + 2], pixels[source + 3])
+                if let key, PaintDocument.matches(pixel, key, tolerance: 0) { continue }
+                let destination = buffer.offset(x: destinationX, y: destinationY)
+                buffer.bytes[destination] = pixel.0
+                buffer.bytes[destination + 1] = pixel.1
+                buffer.bytes[destination + 2] = pixel.2
+                buffer.bytes[destination + 3] = pixel.3
+            }
+        }
+    }
+
     // MARK: Eyedropper
 
     /// Samples the composite, so picking from a shape, a doodle or a run of
@@ -1052,7 +1249,10 @@ final class PaintDocument: ObservableObject {
         )
     }
 
-    private static func components(of color: NSColor) -> (UInt8, UInt8, UInt8, UInt8) {
+    /// sRGB components as stored in the bitmap: premultiplied 8-bit. Shared
+    /// with the canvas, which keys the floating selection preview against the
+    /// same bytes the commit will compare.
+    static func components(of color: NSColor) -> (UInt8, UInt8, UInt8, UInt8) {
         let srgb = color.usingColorSpace(.sRGB) ?? NSColor.black
         let alpha = srgb.alphaComponent
         // Stored premultiplied, matching the bitmap layout.

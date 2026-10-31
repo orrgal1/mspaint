@@ -109,6 +109,12 @@ private struct RibbonBar: View {
                         ForEach(PaintTool.drawingTools) { tool in
                             ToolButton(tool: tool, session: session)
                         }
+                        // The classic Paint pair of draw-mode icons, offered
+                        // only while the selection tool they belong to is
+                        // active — like the toolbox did below its select tools.
+                        if session.tool == .rectSelect {
+                            SelectionModeControl(session: session)
+                        }
                     }
                 }
                 ribbonDivider
@@ -250,6 +256,96 @@ private struct ToolButton: View {
     private var helpText: String {
         guard let shortcut = tool.shortcut else { return tool.title }
         return "\(tool.title) (\(String(shortcut).uppercased()))"
+    }
+}
+
+/// The classic MS Paint draw-mode pair, shown only while Rectangular Select is
+/// the active tool: opaque drops the captured pixels whole, transparent leaves
+/// out the ones matching Color 2 so the canvas shows through them.
+private struct SelectionModeControl: View {
+    @ObservedObject var session: PaintSession
+
+    private static let modes: [(mode: SelectionDrawMode, title: String)] = [
+        (.opaque, "Opaque"),
+        (.transparent, "Transparent"),
+    ]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(Self.modes, id: \.mode) { choice in
+                button(for: choice.mode, title: choice.title)
+            }
+        }
+        .help("Selection draw mode — Transparent treats pixels matching Color 2 as see-through")
+    }
+
+    private func button(for mode: SelectionDrawMode, title: String) -> some View {
+        let isSelected = session.selectionDrawMode == mode
+        let tint = isSelected ? Color.accentColor : Color.primary
+        return Button {
+            session.selectionDrawMode = mode
+        } label: {
+            VStack(spacing: 4) {
+                SelectionModeGlyph(mode: mode, tint: tint)
+                    .frame(width: 26, height: 16)
+                Text(title)
+                    .font(.system(size: 9, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            }
+            .frame(width: 52, height: 38)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(isSelected ? Color.accentColor.opacity(0.55) : Color.secondary.opacity(0.22))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(title == "Opaque"
+              ? "Opaque — the selection drops with every pixel it captured"
+              : "Transparent — pixels matching Color 2 stay see-through")
+        .accessibilityLabel("\(title) selection")
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+    }
+}
+
+/// The mode's own icon, drawn rather than an SF Symbol: both modes carry the
+/// same ink, and only the background behind it changes — filled for opaque,
+/// dashed-hollow for transparent, exactly the pair the classic toolbox showed.
+private struct SelectionModeGlyph: View {
+    let mode: SelectionDrawMode
+    let tint: Color
+
+    var body: some View {
+        Canvas { context, size in
+            let rect = CGRect(origin: .zero, size: size).insetBy(dx: 1.5, dy: 1.5)
+            let frame = Path(roundedRect: rect, cornerRadius: 2, style: .continuous)
+            switch mode {
+            case .opaque:
+                context.fill(frame, with: .color(tint.opacity(0.2)))
+                context.stroke(frame, with: .color(tint), lineWidth: 1)
+            case .transparent:
+                context.stroke(
+                    frame,
+                    with: .color(tint),
+                    style: StrokeStyle(lineWidth: 1, dash: [2.5, 2])
+                )
+            }
+
+            // The ink rides identically in both: the mode changes only what
+            // happens behind it.
+            let ink = CGRect(
+                x: rect.minX + rect.width * 0.32,
+                y: rect.minY + rect.height * 0.2,
+                width: rect.width * 0.36,
+                height: rect.height * 0.6
+            )
+            context.fill(Path(ellipseIn: ink), with: .color(tint))
+        }
+        .accessibilityHidden(true)
     }
 }
 

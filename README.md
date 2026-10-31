@@ -2,7 +2,7 @@
 
 A native, open-source **Microsoft Paint–style drawing app for macOS**, built entirely with **SwiftUI, AppKit, and Core Graphics**.
 
-Paint provides the familiar simplicity of classic MS Paint in a fast Mac desktop application: freehand drawing, brushes, an eraser, flood fill, text, colors, image resizing, 22 shapes, and editable canvas entities that can be selected, moved, resized, rotated, recolored, and undone.
+Paint provides the familiar simplicity of classic MS Paint in a fast Mac desktop application: freehand drawing, brushes, an eraser, flood fill, text, colors, image resizing, 22 shapes, a rectangular pixel selection with the classic opaque/transparent drop modes, and editable canvas entities that can be selected, moved, resized, rotated, recolored, and undone.
 
 > Looking for a lightweight native macOS drawing program, pixel editor, or MS Paint alternative for Mac? This project is designed for exactly that use case.
 
@@ -11,11 +11,13 @@ Paint provides the familiar simplicity of classic MS Paint in a fast Mac desktop
 - Native macOS interface with a Paint-style ribbon, toolbox, palette, canvas, and status bar
 - Pencil, Brush, Thick Brush, Eraser, Fill, Eyedropper, and Text tools
 - 22 built-in shapes, including lines, curves, rectangles, ellipses, triangles, arrows, stars, callouts, a heart, and a lightning bolt
+- Rectangular Select tool: drag a marquee over any pixels and carry them as a floating selection
+- Opaque and transparent selection drop modes — transparent leaves out every pixel matching Color 2, exactly like classic MS Paint
 - Hand selection tool for editable shapes, lines, text, and freehand strokes
 - Move, eight-handle resize, and Google Drawings–style rotation controls
 - Hold **Shift** while rotating to snap to 15° increments
 - Recolor the selected entity by choosing Color 1
-- Undo and redo for drawing, transforms, recoloring, deletion, fill, clear, and canvas changes
+- Undo and redo for drawing, transforms, recoloring, deletion, selection moves, fill, clear, and canvas changes
 - Primary and secondary colors with palette, color wells, eyedropper, and color swapping
 - Zoom from 25% to 200%
 - Resizable canvas up to 4096 × 4096 pixels
@@ -69,6 +71,18 @@ swift run Paint
 
 Entities remain editable during the current document session. Opening an image creates a raster background, and saving to PNG produces a standard flattened image.
 
+## Using the Rectangular Selection
+
+1. Choose the **Rectangular Select** tool and drag a rectangle over the pixels you want.
+2. Drag inside the rectangle to carry the pixels as a floating selection; the vacated area fills with Color 2.
+3. With the tool active, the ribbon shows the classic pair of drop modes:
+   - **Opaque** drops every captured pixel.
+   - **Transparent** treats pixels matching Color 2 as see-through, so the canvas shows through them — pick the color to drop with Color 2 (the eyedropper is the fastest way).
+4. Drop the selection by clicking outside it, pressing **Escape**, or switching tools; the whole move is one undo step.
+5. Press **Delete** or **Backspace** to fill the rectangle with Color 2 instead of moving it.
+
+Any entity the rectangle covers is flattened into the bitmap when the pixels move, like classic Paint; entities clear of the rectangle stay editable.
+
 ## Keyboard Shortcuts
 
 | Action | Shortcut |
@@ -84,7 +98,7 @@ Entities remain editable during the current document session. Opening an image c
 | Zoom in / out | `⌘+` / `⌘-` |
 | Actual size | `⌘0` |
 | Swap colors | `⇧⌘X` |
-| Delete selected entity | `Delete` or `Backspace` |
+| Delete selection or entity | `Delete` or `Backspace` |
 | Cancel or deselect | `Escape` |
 | Snap rotation | Hold `Shift` while rotating |
 
@@ -98,7 +112,7 @@ Run the behavioral model smoke suite:
 bash test-model.sh
 ```
 
-The test harness compiles the document model with AppKit and Core Graphics, then exercises drawing, shapes, text, entity selection and transforms, recoloring, flood fill, image operations, and undo/redo behavior.
+The test harness compiles the document model with AppKit and Core Graphics, then exercises drawing, shapes, text, entity selection and transforms, recoloring, flood fill, opaque and transparent selection moves, image operations, and undo/redo behavior.
 
 Also verify the complete application build with:
 

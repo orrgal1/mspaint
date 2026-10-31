@@ -13,6 +13,10 @@ final class PaintSession: ObservableObject {
     @Published var tool: PaintTool = .pencil
     @Published var primaryColor: Color = .black
     @Published var secondaryColor: Color = .white
+    /// How a Rectangular Select drop paints: blitting every captured pixel, or
+    /// leaving out the ones that match Color 2 — the classic Paint pair of
+    /// opaque / transparent selection icons.
+    @Published var selectionDrawMode: SelectionDrawMode = .opaque
     @Published var zoom: Double = 1
     @Published var cursorPosition: CGPoint?
     /// The entity the canvas has selected, mirrored here so a Color 1 choice knows
