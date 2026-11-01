@@ -109,6 +109,12 @@ private struct RibbonBar: View {
                         ForEach(PaintTool.drawingTools) { tool in
                             ToolButton(tool: tool, session: session)
                         }
+                        // The classic Paint pair of draw-mode icons, offered
+                        // only while the selection tool they belong to is
+                        // active — like the toolbox did below its select tools.
+                        if session.tool == .rectSelect {
+                            SelectionModeControl(session: session)
+                        }
                     }
                 }
                 ribbonDivider
@@ -253,6 +259,96 @@ private struct ToolButton: View {
     }
 }
 
+/// The classic MS Paint draw-mode pair, shown only while Rectangular Select is
+/// the active tool: opaque drops the captured pixels whole, transparent leaves
+/// out the ones matching Color 2 so the canvas shows through them.
+private struct SelectionModeControl: View {
+    @ObservedObject var session: PaintSession
+
+    private static let modes: [(mode: SelectionDrawMode, title: String)] = [
+        (.opaque, "Opaque"),
+        (.transparent, "Transparent"),
+    ]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(Self.modes, id: \.mode) { choice in
+                button(for: choice.mode, title: choice.title)
+            }
+        }
+        .help("Selection draw mode — Transparent treats pixels matching Color 2 as see-through")
+    }
+
+    private func button(for mode: SelectionDrawMode, title: String) -> some View {
+        let isSelected = session.selectionDrawMode == mode
+        let tint = isSelected ? Color.accentColor : Color.primary
+        return Button {
+            session.selectionDrawMode = mode
+        } label: {
+            VStack(spacing: 4) {
+                SelectionModeGlyph(mode: mode, tint: tint)
+                    .frame(width: 26, height: 16)
+                Text(title)
+                    .font(.system(size: 9, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            }
+            .frame(width: 52, height: 38)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(isSelected ? Color.accentColor.opacity(0.55) : Color.secondary.opacity(0.22))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(title == "Opaque"
+              ? "Opaque — the selection drops with every pixel it captured"
+              : "Transparent — pixels matching Color 2 stay see-through")
+        .accessibilityLabel("\(title) selection")
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+    }
+}
+
+/// The mode's own icon, drawn rather than an SF Symbol: both modes carry the
+/// same ink, and only the background behind it changes — filled for opaque,
+/// dashed-hollow for transparent, exactly the pair the classic toolbox showed.
+private struct SelectionModeGlyph: View {
+    let mode: SelectionDrawMode
+    let tint: Color
+
+    var body: some View {
+        Canvas { context, size in
+            let rect = CGRect(origin: .zero, size: size).insetBy(dx: 1.5, dy: 1.5)
+            let frame = Path(roundedRect: rect, cornerRadius: 2, style: .continuous)
+            switch mode {
+            case .opaque:
+                context.fill(frame, with: .color(tint.opacity(0.2)))
+                context.stroke(frame, with: .color(tint), lineWidth: 1)
+            case .transparent:
+                context.stroke(
+                    frame,
+                    with: .color(tint),
+                    style: StrokeStyle(lineWidth: 1, dash: [2.5, 2])
+                )
+            }
+
+            // The ink rides identically in both: the mode changes only what
+            // happens behind it.
+            let ink = CGRect(
+                x: rect.minX + rect.width * 0.32,
+                y: rect.minY + rect.height * 0.2,
+                width: rect.width * 0.36,
+                height: rect.height * 0.6
+            )
+            context.fill(Path(ellipseIn: ink), with: .color(tint))
+        }
+        .accessibilityHidden(true)
+    }
+}
+
 /// Miniature preview of a shape tool, stroked from the shared geometry so the
 /// icon can never drift from what the tool draws.
 private struct ShapeGlyph: View {
@@ -385,6 +481,14 @@ private struct CanvasWorkspace: View {
     @ObservedObject var session: PaintSession
     @ObservedObject var document: PaintDocument
 
+    /// Document size a grip drag is previewing, `nil` at rest. The draft sizes
+    /// both the canvas frame and the view's own resize preview, and commits as
+    /// the single `PaintSession.resizeCanvas` step on release.
+    @State private var resizeDraft: CGSize?
+    /// Size the running drag started from, so the draft is re-derived from one
+    /// base instead of accumulating a delta per event.
+    @State private var resizeBase: CGSize = .zero
+
     var body: some View {
         GeometryReader { proxy in
             ScrollView([.horizontal, .vertical]) {
@@ -393,23 +497,166 @@ private struct CanvasWorkspace: View {
                     .frame(
                         minWidth: proxy.size.width,
                         minHeight: proxy.size.height,
-                        alignment: .center
+                        alignment: .topLeading
                     )
             }
         }
         .background(Color(nsColor: .underPageBackgroundColor))
     }
 
-    private var canvas: some View {
-        PaintCanvasRepresentable(session: session, document: document)
-            .frame(
-                width: max(document.canvasSize.width * session.zoom, 1),
-                height: max(document.canvasSize.height * session.zoom, 1)
-            )
-            .background(Color.white)
-            .overlay(Rectangle().strokeBorder(Color.secondary.opacity(0.45), lineWidth: 1))
-            .shadow(color: .black.opacity(0.22), radius: 6, x: 0, y: 2)
+    private var previewSize: CGSize {
+        resizeDraft ?? document.canvasSize
     }
+
+    private var canvas: some View {
+        PaintCanvasRepresentable(
+            session: session,
+            document: document,
+            pendingCanvasSize: resizeDraft
+        )
+        .frame(
+            width: max(previewSize.width * session.zoom, 1),
+            height: max(previewSize.height * session.zoom, 1)
+        )
+        .background(Color.white)
+        .overlay(Rectangle().strokeBorder(Color.secondary.opacity(0.45), lineWidth: 1))
+        .shadow(color: .black.opacity(0.22), radius: 6, x: 0, y: 2)
+        .overlay(resizeGrip(.horizontal), alignment: .trailing)
+        .overlay(resizeGrip(.vertical), alignment: .bottom)
+        .overlay(resizeGrip(.corner), alignment: .bottomTrailing)
+    }
+
+    /// One canvas grip, centered on its anchor point on the canvas border the
+    /// way the original Paint places its handles: the bottom-right vertex for
+    /// the corner grip, the edge midpoint for the two single-axis grips. The
+    /// drag stays anchored to the canvas top-left (the alignment above keeps
+    /// it there during the preview), so the grip tracks the pointer exactly.
+    private func resizeGrip(_ axis: CanvasResizeAxis) -> some View {
+        let side = CanvasResizeHandle.hitSide
+        return CanvasResizeHandle(axis: axis)
+            .offset(
+                x: axis.resizesWidth ? side / 2 : 0,
+                y: axis.resizesHeight ? side / 2 : 0
+            )
+            .gesture(resizeDrag(axis))
+            .help(axis.helpText)
+    }
+
+    private func resizeDrag(_ axis: CanvasResizeAxis) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                if resizeDraft == nil {
+                    resizeBase = document.canvasSize
+                }
+                let limit = CGFloat(PaintSession.dimensionRange.upperBound)
+                let zoom = max(session.zoom, 0.1)
+                let width = axis.resizesWidth
+                    ? min(max((resizeBase.width + value.translation.width / zoom).rounded(), 1), limit)
+                    : resizeBase.width
+                let height = axis.resizesHeight
+                    ? min(max((resizeBase.height + value.translation.height / zoom).rounded(), 1), limit)
+                    : resizeBase.height
+                resizeDraft = CGSize(width: width, height: height)
+            }
+            .onEnded { _ in
+                if let draft = resizeDraft {
+                    session.resizeCanvas(width: Int(draft.width), height: Int(draft.height))
+                }
+                resizeDraft = nil
+            }
+    }
+}
+
+/// Which dimensions a canvas grip drag may change.
+private enum CanvasResizeAxis {
+    /// The bottom-right corner: width and height.
+    case corner
+    /// The midpoint of the right edge: width only.
+    case horizontal
+    /// The midpoint of the bottom edge: height only.
+    case vertical
+
+    var resizesWidth: Bool { self != .vertical }
+    var resizesHeight: Bool { self != .horizontal }
+
+    var cursor: NSCursor {
+        switch self {
+        case .corner: return CanvasResizeCursor.cursor
+        case .horizontal: return .resizeLeftRight
+        case .vertical: return .resizeUpDown
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .corner: return "Drag to resize the canvas"
+        case .horizontal: return "Drag to resize the canvas width"
+        case .vertical: return "Drag to resize the canvas height"
+        }
+    }
+}
+
+/// A canvas grip: a small white square centered on its anchor point on the
+/// canvas border, the affordance the original Paint draws for canvas resizing.
+/// The invisible grab area is larger than the artwork so the grip stays easy
+/// to take.
+private struct CanvasResizeHandle: View {
+    let axis: CanvasResizeAxis
+
+    /// The drawn square, in view points.
+    static let squareSide: CGFloat = 5
+    /// The invisible grab area around it.
+    static let hitSide: CGFloat = 14
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.white)
+            .frame(width: Self.squareSide, height: Self.squareSide)
+            .frame(width: Self.hitSide, height: Self.hitSide)
+            .contentShape(Rectangle())
+            .onHover { hovering in
+                if hovering {
+                    axis.cursor.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+    }
+}
+
+/// The double-headed diagonal arrow for the canvas corner grip. AppKit only
+/// publishes the axis-aligned resize cursors, so the grip draws its own, in the
+/// same black-rim white-core style as the tool cursors.
+private enum CanvasResizeCursor {
+    static let cursor: NSCursor = {
+        let image = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { _ in
+            guard let context = NSGraphicsContext.current?.cgContext else { return true }
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: 9, y: 23))
+            path.addLine(to: CGPoint(x: 23, y: 9))
+            path.move(to: CGPoint(x: 9, y: 23))
+            path.addLine(to: CGPoint(x: 9, y: 15.5))
+            path.move(to: CGPoint(x: 9, y: 23))
+            path.addLine(to: CGPoint(x: 16.5, y: 23))
+            path.move(to: CGPoint(x: 23, y: 9))
+            path.addLine(to: CGPoint(x: 23, y: 16.5))
+            path.move(to: CGPoint(x: 23, y: 9))
+            path.addLine(to: CGPoint(x: 15.5, y: 9))
+            for (color, width) in [(NSColor.black, CGFloat(3.0)), (NSColor.white, CGFloat(1.4))] {
+                context.saveGState()
+                context.setShouldAntialias(true)
+                context.setLineCap(.round)
+                context.setLineJoin(.round)
+                context.setStrokeColor(color.cgColor)
+                context.setLineWidth(width)
+                context.addPath(path)
+                context.strokePath()
+                context.restoreGState()
+            }
+            return true
+        }
+        return NSCursor(image: image, hotSpot: NSPoint(x: 16, y: 16))
+    }()
 }
 
 // MARK: - Status bar

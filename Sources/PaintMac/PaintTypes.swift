@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import SwiftUI
 
 /// The drawing tools offered by the toolbox, in palette order.
 ///
@@ -12,6 +13,10 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// The hand tool: it paints nothing and instead picks up whole entities to
     /// move, resize and rotate them.
     case select
+    /// The raster marquee: drags a rectangle out of the composited pixels and
+    /// moves it as a floating bitmap, opaque or — see `SelectionDrawMode` —
+    /// with every pixel matching Color 2 keyed out.
+    case rectSelect
     case pencil
     case brush
     case thickBrush
@@ -48,7 +53,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
 
     /// The freehand and sampling tools, in palette order.
     static let drawingTools: [PaintTool] = [
-        .select, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
+        .select, .rectSelect, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text,
     ]
 
     /// The shape catalog, in the order the shape picker renders it.
@@ -64,7 +69,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// True for every tool drawn by dragging out a shape from `PaintShapeGeometry`.
     var isShape: Bool {
         switch self {
-        case .select, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text:
+        case .select, .rectSelect, .pencil, .brush, .thickBrush, .eraser, .fill, .eyedropper, .text:
             return false
         case .line, .curve, .rectangle, .roundedRectangle, .ellipse,
             .triangle, .rightTriangle, .diamond, .pentagon, .hexagon,
@@ -80,6 +85,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .select: return "Select"
+        case .rectSelect: return "Rectangular Select"
         case .pencil: return "Pencil"
         case .brush: return "Brush"
         case .thickBrush: return "Thick Brush"
@@ -117,6 +123,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     var symbolName: String {
         switch self {
         case .select: return "hand.point.up.left.fill"
+        case .rectSelect: return "rectangle.dashed"
         case .pencil: return "pencil"
         case .brush: return "paintbrush.pointed.fill"
         case .thickBrush: return "paintbrush.fill"
@@ -156,6 +163,7 @@ enum PaintTool: String, CaseIterable, Identifiable {
     var shortcut: Character? {
         switch self {
         case .select: return "s"
+        case .rectSelect: return nil
         case .pencil: return "p"
         case .brush: return "b"
         case .thickBrush: return nil
@@ -179,10 +187,11 @@ enum PaintTool: String, CaseIterable, Identifiable {
     /// the tool itself, so there is nothing to configure: Pencil is a single
     /// pixel, Brush is the medium stroke, Thick Brush is the deliberately broad
     /// marker, Eraser matches Brush exactly, and text and shapes share a fine
-    /// outline. Select, Fill and Eyedropper never stroke, so their value is unused.
+    /// outline. Select, Rectangular Select, Fill and Eyedropper never stroke,
+    /// so their value is unused.
     var strokeWidth: CGFloat {
         switch self {
-        case .select, .pencil, .fill, .eyedropper: return 1
+        case .select, .rectSelect, .pencil, .fill, .eyedropper: return 1
         case .brush, .eraser: return 16
         case .thickBrush: return 64
         case .text,
@@ -193,6 +202,24 @@ enum PaintTool: String, CaseIterable, Identifiable {
             .rectangularCallout, .roundedCallout, .ovalCallout,
             .heart, .lightning:
             return 4
+        }
+    }
+}
+
+/// How a floating Rectangular Select drop paints over the canvas, mirroring
+/// the two icons the classic MS Paint toolbox shows under its selection
+/// tools. Opaque blits every captured pixel; transparent leaves the pixels
+/// that exactly match Color 2 out of the blit, so the destination shows
+/// through wherever the selection carried the background colour.
+enum SelectionDrawMode: Equatable {
+    case opaque
+    case transparent
+
+    /// The colour treated as see-through, read from Color 2 at draw time.
+    func keyColor(secondary: Color) -> Color? {
+        switch self {
+        case .opaque: return nil
+        case .transparent: return secondary
         }
     }
 }

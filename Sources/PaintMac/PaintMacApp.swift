@@ -13,12 +13,22 @@ final class PaintSession: ObservableObject {
     @Published var tool: PaintTool = .pencil
     @Published var primaryColor: Color = .black
     @Published var secondaryColor: Color = .white
+    /// How a Rectangular Select drop paints: blitting every captured pixel, or
+    /// leaving out the ones that match Color 2 — the classic Paint pair of
+    /// opaque / transparent selection icons.
+    @Published var selectionDrawMode: SelectionDrawMode = .opaque
     @Published var zoom: Double = 1
     @Published var cursorPosition: CGPoint?
     /// The entity the canvas has selected, mirrored here so a Color 1 choice knows
     /// what to repaint. The canvas is the only writer: it reports every transition,
     /// including the ones a stale or deleted entity forces.
     @Published var selectedEntityID: UUID?
+    /// Mirrors the canvas marquee's existence, so the Edit menu can enable
+    /// Cut and Copy only when there is something to take.
+    @Published var hasMarqueeSelection = false
+    /// The canvas implements the Edit-menu clipboard commands: the marquee and
+    /// its floating pixels live there. Set when the canvas is created.
+    weak var canvasCommands: PaintCanvasCommands?
     @Published var isPresentingResize = false
     @Published private(set) var fileURL: URL?
 
@@ -84,6 +94,32 @@ final class PaintSession: ObservableObject {
         let clampedHeight = min(max(height, Self.dimensionRange.lowerBound), Self.dimensionRange.upperBound)
         document.resize(width: clampedWidth, height: clampedHeight, background: .white)
         isPresentingResize = false
+    }
+
+    // MARK: Clipboard
+
+    /// True when the pasteboard carries something NSImage can read, which is
+    /// what Paste accepts from any app.
+    var pasteboardHasImage: Bool {
+        NSPasteboard.general.canReadObject(forClasses: [NSImage.self], options: nil)
+    }
+
+    /// The clipboard commands act on the canvas, where the marquee lives; the
+    /// session forwards and owns the file panel for Paste From File.
+    func copySelection() { canvasCommands?.copySelectionToPasteboard() }
+    func cutSelection() { canvasCommands?.cutSelectionToPasteboard() }
+    func pasteFromPasteboard() { canvasCommands?.pasteFromPasteboard() }
+    func selectAllPixels() { canvasCommands?.selectAllPixels() }
+
+    /// Asks for an image file and pastes it onto the canvas as a selection.
+    func pasteFromFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Paste From File"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.png, .jpeg, .tiff, .bmp, .gif, .heic, .image]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        canvasCommands?.pasteImage(at: url)
     }
 
     // MARK: File actions
@@ -258,6 +294,24 @@ private struct PaintCommands: Commands {
             Button("Redo") { session.redo() }
                 .keyboardShortcut("z", modifiers: [.command, .shift])
                 .disabled(!document.canRedo)
+        }
+
+        // The classic Paint clipboard set. Cut and Copy mean a Rectangular
+        // Select marquee; Paste accepts a bitmap from any app.
+        CommandGroup(replacing: .pasteboard) {
+            Button("Cut") { session.cutSelection() }
+                .keyboardShortcut("x", modifiers: .command)
+                .disabled(!session.hasMarqueeSelection)
+            Button("Copy") { session.copySelection() }
+                .keyboardShortcut("c", modifiers: .command)
+                .disabled(!session.hasMarqueeSelection)
+            Button("Paste") { session.pasteFromPasteboard() }
+                .keyboardShortcut("v", modifiers: .command)
+                .disabled(!session.pasteboardHasImage)
+            Button("Paste From File…") { session.pasteFromFile() }
+            Divider()
+            Button("Select All") { session.selectAllPixels() }
+                .keyboardShortcut("a", modifiers: .command)
         }
 
         CommandMenu("Tools") {
